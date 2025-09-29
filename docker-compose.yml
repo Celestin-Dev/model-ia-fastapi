@@ -1,0 +1,29 @@
+version: "3.8"
+services:
+  mysql-db:
+    image: mysql:8
+    environment:
+      MYSQL_DATABASE: admin
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  fastapi-app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DB_HOST: mysql-db
+      DB_PORT: 3306
+      DB_USER: admin
+      DB_PASSWORD: admin
+      DB_NAME: admin
+    depends_on:
+      - mysql-db
+
+volumes:
+  mysql-data:
