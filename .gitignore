@@ -1,3 +1,8 @@
 sample.mp4
 __pycache__/
 static/__pycache__/
+.vscode/
+venv/
+.env/
+env/
+*.pyc   
