@@ -1,29 +1,28 @@
-version: "3.8"
 services:
-  mysql-db:
-    image: mysql:8
+  db:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: always
     environment:
-      MYSQL_DATABASE: admin
-      MYSQL_ROOT_PASSWORD: admin
-      MYSQL_USER: admin
-      MYSQL_PASSWORD: admin
+      MYSQL_ROOT_PASSWORD: celestin20
+      MYSQL_DATABASE: vehicledb
+      MYSQL_USER: celestin20
+      MYSQL_PASSWORD: celestin20
     ports:
       - "3306:3306"
     volumes:
-      - mysql-data:/var/lib/mysql
+      - db_data:/var/lib/mysql
 
-  fastapi-app:
+  fastapi:
     build: .
+    container_name: fastapi_app
+    restart: always
     ports:
       - "8000:8000"
-    environment:
-      DB_HOST: mysql-db
-      DB_PORT: 3306
-      DB_USER: admin
-      DB_PASSWORD: admin
-      DB_NAME: admin
     depends_on:
-      - mysql-db
+      - db
+    environment:
+      DATABASE_URL: mysql+pymysql://celestin20:celestin20@db:3306/vehicledb
 
 volumes:
-  mysql-data:
+  db_data:
