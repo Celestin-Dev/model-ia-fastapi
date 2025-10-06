@@ -1,29 +1,32 @@
 import asyncio
-from fastapi import FastAPI, WebSocket, Depends
+from fastapi import FastAPI, Request, WebSocket, Depends
+from fastapi.responses import JSONResponse
 import numpy as np
 from ultralytics import YOLO
 import cv2
 import time
+from datetime import datetime
 from util import get_car, read_license_plate, draw_border
 from sort.sort import Sort
 import base64
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 from model import Base
-from detection import save_detection, get_info_vehicle_by_nplate_car_id_datedetection, get_vehicle_by_number_plate
-# mémoire globale des véhicules déjà détectés
+from detection import *
+
+# mémoire globale
 detected_cars = {}
 vehicle_positions = {}
 vehicle_speeds = {}
-
 
 def init_models():
     coco_model = YOLO('yolov8n.pt')
     license_plate_detector = YOLO('license_plate_detector.pt')
     return coco_model, license_plate_detector
 
-#traitement d'une frame
-def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_tracker, previous_detections=None, vehicle_count=0):
+# traitement d'une frame
+def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_tracker,
+                  previous_detections=None, vehicle_count=0):
     global detected_cars, vehicle_positions, vehicle_speeds
 
     if previous_detections is None:
@@ -39,40 +42,54 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
     line_position = int(height * 0.6)
     cv2.line(frame, (0, line_position), (width, line_position), (0, 0, 255), 2)
 
+    # Dictionnaire classes COCO
+    COCO_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+
     for detection in detections.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = detection
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         y_center = int((y1 + y2) / 2)
-        x_center = int((x1 + x2)/2)
+        x_center = int((x1 + x2) / 2)
 
         if int(class_id) in vehicles and y_center > line_position:
-            vehicle_id = f"{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}"
+            vehicle_id = f"{x1}_{y1}_{x2}_{y2}"
             current_detections.add(vehicle_id)
+
+            # Nouveau véhicule
             if vehicle_id not in previous_detections:
                 vehicle_count += 1
-                cv2.putText(frame, "NEW", (int(x1), int(y1) - 10),
+                cv2.putText(frame, "NEW", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            draw_border(frame, (int(x1), int(y1)), (int(x2), int(y2)),
-                        (0, 255, 0), 25, line_length_x=200, line_length_y=200)
+
+            # Dessiner bordure
+            draw_border(frame, (x1, y1), (x2, y2), (0, 255, 0), 25, line_length_x=200, line_length_y=200)
             detections_.append([x1, y1, x2, y2, score])
 
-            #calcul vitesse
-            if(vehicle_id in vehicle_positions):
+            # Calcul de la vitesse
+            speed_px = 0.0
+            if vehicle_id in vehicle_positions:
                 prev_x, prev_y, prev_time = vehicle_positions[vehicle_id]
                 dt = time.time() - prev_time
                 dx = x_center - prev_x
                 dy = y_center - prev_y
-                speed_px = ((dx**2 + dy**2)**0.5) /dt if dt > 0 else 0
+                speed_px_new = ((dx**2 + dy**2)**0.5) / dt if dt > 0 else 0
+                # Stabilisation vitesse avec moyenne glissante
+                prev_speed = vehicle_speeds.get(vehicle_id, 0.0)
+                speed_px = 0.7 * prev_speed + 0.3 * speed_px_new
                 vehicle_speeds[vehicle_id] = speed_px
+
             vehicle_positions[vehicle_id] = (x_center, y_center, time.time())
 
-            #Affichage de vitesse
-            if(vehicle_id in vehicle_speeds):
-                speed_px = vehicle_speeds[vehicle_id]
-                #conversion pixels/sec -> Km/h
-                pixel_to_meter = 0.05
-                speed_kmh = speed_px * pixel_to_meter * 3.6
-                cv2.putText(frame, f"Speed: {speed_kmh:.2f} km/h", (int(x1), int(y1) - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            # Conversion pixels/sec -> Km/h
+            pixel_to_meter = 0.05
+            speed_kmh = speed_px * pixel_to_meter * 3.6
+
+            # Récupérer la classe du véhicule
+            vehicle_class_name = COCO_CLASSES.get(int(class_id), "unknown")
+
+            # Affichage classe + vitesse
+            cv2.putText(frame, f"{vehicle_class_name} {speed_kmh:.1f} km/h", (x1, y1 - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     previous_detections.clear()
     previous_detections.update(current_detections)
@@ -84,36 +101,38 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
     license_plates = license_plate_detector(frame)[0]
     for license_plate in license_plates.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = license_plate
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         center_y_plate = (y1 + y2) / 2
         if center_y_plate >= line_position:
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             xcar1, ycar1, xcar2, ycar2, car_id = get_car(license_plate, track_ids)
             if car_id != -1:
-                license_plate_crop = frame[int(y1):int(y2), int(x1): int(x2), :]
+                license_plate_crop = frame[y1:y2, x1:x2, :]
                 license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
                 _, license_plate_crop_thresh = cv2.threshold(license_plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
                 license_plate_text, license_plate_text_score = read_license_plate(license_plate_crop_thresh)
                 if license_plate_text is not None:
-                    # Sauvegarder les infos dans detected_cars
                     detected_cars[car_id] = {
                         'car_id': int(car_id),
                         'car_detection_score': float(score),
                         'car_bbox': [int(xcar1), int(ycar1), int(xcar2), int(ycar2)],
-                        'license_plate_bbox': [int(x1), int(y1), int(x2), int(y2)],
+                        'license_plate_bbox': [x1, y1, x2, y2],
                         'license_number': license_plate_text,
                         'license_number_score': float(license_plate_text_score),
-                        'speed_kmh': vehicle_speeds.get(f"{int(xcar1)}_{int(ycar1)}_{int(xcar2)}_{int(ycar2)}", 0)
+                        'speed_kmh': speed_kmh,
+                        'vehicle_class': vehicle_class_name
                     }
                     results.append(detected_cars[car_id])
 
-    # 🔹 Réafficher les infos déjà connues
+    # Réafficher les infos déjà connues
     for cid, car in detected_cars.items():
         x1, y1, x2, y2 = car['car_bbox']
         plate = car['license_number']
-        cv2.putText(frame, f"ID:{cid} Plate:{plate}", (x1, y1 - 10),
+        vehicle_class_name = car.get('vehicle_class', 'unknown')
+        cv2.putText(frame, f"ID:{cid} {vehicle_class_name} Plate:{plate}", (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-    # Affichage du compteur
+    # Affichage compteur véhicules
     cv2.putText(frame, f'Nombre total de vehicules: {vehicle_count}', (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
@@ -123,7 +142,7 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
 async def generate_detections(video_path="sample.mp4"):
     coco_model, license_plate_detector = init_models()
     mot_tracker = Sort()
-    vehicles = [2, 3, 5, 7]  # COCO classes: car, motorbike, bus, truck
+    vehicles = [2, 3, 5, 7]  # car, motorbike, bus, truck
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
@@ -151,33 +170,29 @@ async def generate_detections(video_path="sample.mp4"):
         elapsed = time.time() - start_time
         fps = frame_count / elapsed if elapsed > 0 else 0
 
-        # _, buffer = cv2.imencode(".jpg", frame)
-        # frameb64 = base64.b64encode(buffer).decode("utf-8")
-        # Réduire la taille + qualité JPEG plus faible
+        # compression
         frame_resized = cv2.resize(frame, (640, 360))
         _, buffer = cv2.imencode('.jpg', frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         frameb64 = base64.b64encode(buffer).decode("utf-8")
-
 
         yield {
             "frame_nmr": frame_nmr,
             "video": frameb64,
             "fps": fps,
-            "detections": detections,          # résultats de cette frame
-            "vehicle_count": vehicle_count,    # compteur incrémental
-            "all_detected_cars": list(detected_cars.values())  # ✅ toutes les voitures mémorisées
+            "detections": detections,
+            "vehicle_count": vehicle_count,
+            "all_detected_cars": list(detected_cars.values())
         }
 
-        await asyncio.sleep(0.03)  # pour ne pas bloquer l'event loop
+        await asyncio.sleep(1/30)
 
     cap.release()
 
 
 app = FastAPI()
-
 Base.metadata.create_all(bind=engine)
 
-#Dependency DB
+# Dependency DB
 def get_db():
     db = SessionLocal()
     try:
@@ -190,33 +205,109 @@ def get_db():
 async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
     await websocket.accept()
     async for result in generate_detections("sample.mp4"):
-        # Sauvegarder chaque détection dans MySQL
         for det in result["detections"]:
-            save_detection(db, det["car_id"], det["car_detection_score"], det["license_number"], det["license_number_score"], det["car_bbox"])
-
-        # Envoyer le flux vidéo + détections au client
+            save_detection(db, det["car_id"], det["car_detection_score"], det["license_number"], det["license_number_score"], det["car_bbox"], det["vehicle_class"], det["speed_kmh"])
         await websocket.send_json(result)
 
-#recupere un vehicule par numero de plaque
-@app.get("/vehicle/{license_plate}")
-def read_vehicle_by_plate(license_plate: str, db: Session = Depends(get_db)):
-    vehicle = get_vehicle_by_number_plate(db, license_plate)
+
+@app.get("/vehicle")
+def read_vehicle_by_plate(license_plate: str, license_plate_score:float, timestamp:str, db: Session = Depends(get_db)):
+    vehicle = get_vehicle_by_number_plate(db, license_plate, license_plate_score, timestamp)
     if not vehicle:
         return {"message": f"Véhicule avec la plaque {license_plate} introuvable"}
     return vehicle
 
-#recupere les detailes de vehicule entre une date precis
-@app.get("/vehicle/details")
-def read_details_vehicle(
-    license_plate: str,
-    car_id: int,
-    date_start: str,
-    date_end: str,
-    db: Session = Depends(get_db)
-):
-    details = get_info_vehicle_by_nplate_car_id_datedetection(
-        db, license_plate, car_id, date_start, date_end
-    )
+
+@app.get("/vehicle/search/detail")
+def read_details_vehicle(license_plate: str, car_id: int, date_start: str, date_end:str, db: Session = Depends(get_db)):
+    details = get_info_vehicle_by_nplate_car_id_datedetection(db, license_plate, date_start ,date_end)
     if not details:
         return {"message": "Aucun détail trouvé pour ce véhicule."}
     return details
+
+
+@app.get("/vehicles")
+def read_all_vehicles(db: Session = Depends(get_db)):
+    vehicles = getAllVehicles(db)
+    return vehicles
+
+@app.get("/vehicles/recent")
+def read_recent_vehicles(limit: int = 5, db: Session = Depends(get_db)):
+    vehicles = getLastVehicles(db, limit)
+    return vehicles
+
+@app.get("/vehicles/last5_per_car")
+def read_last_five_per_car(db: Session = Depends(get_db)):
+    return get_last_five_per_car(db)
+
+@app.get("/vehicles/best_per_car")
+def read_best_detection_per_car(db: Session = Depends(get_db)):
+    return get_best_detection_per_car(db)
+
+
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from av import VideoFrame
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
+class CameraStream(VideoStreamTrack):
+    def __init__(self, source=0):
+        super().__init__()
+        self.cap = cv2.VideoCapture(source)
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+        ret, frame = self.cap.read()
+        if not ret:
+            await asyncio.sleep(0.1)
+            return None
+        frame = cv2.resize(frame, (640, 360))
+        av_frame = VideoFrame.from_ndarray(frame, format="bgr24")
+        av_frame.pts = pts
+        av_frame.time_base = time_base
+        return av_frame
+
+# Route d’offre WebRTC
+from aiortc.contrib.media import MediaPlayer
+import os
+pcs = set()
+
+@app.post("/offer")
+async def offer(request: Request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    # --- choisir une source vidéo ---
+    video_source = "sample.mp4"
+    if not os.path.exists(video_source):
+        video_source = 0  # utiliser webcam locale si pas de fichier
+
+    player = MediaPlayer(video_source)
+
+    if player.video:  # sécurise l’ajout
+        pc.addTrack(player.video)
+    if player.audio:
+        pc.addTrack(player.audio)
+
+    # --- WebRTC handshake ---
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type,
+    }
+
+import uvicorn
+if __name__== "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

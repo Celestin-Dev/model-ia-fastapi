@@ -57,59 +57,64 @@
     </div>
 
     <script>
-        // Connecter au serveur WebSocket
-        const ws = new WebSocket("ws://localhost:8000/ws");
+    // Connecter au serveur WebSocket
+    const ws = new WebSocket("ws://localhost:8000/ws");
 
-        const videoFrame = document.getElementById("video-frame");
-        const fpsDisplay = document.getElementById("fps");
-        const tableBody = document.getElementById("table-body");
+    const videoFrame = document.getElementById("video-frame");
+    const fpsDisplay = document.getElementById("fps");
+    const tableBody = document.getElementById("table-body");
 
-        ws.onopen = () => {
-            console.log("Connecté au serveur WebSocket");
-        };
+    ws.onopen = () => {
+        console.log("Connecté au serveur WebSocket");
+    };
 
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
 
-            console.log(data);
-            document.getElementById("vehicle-count").textContent = `Véhicules détectés: ${data.total_vehicles}`;
-            
-            // Afficher la vidéo
-            if (data.video) {
-                videoFrame.src = "data:image/jpeg;base64," + data.video;
-            }
+        console.log(data);
+        document.getElementById("vehicle-count").textContent = `Véhicules détectés: ${data.vehicle_count}`;
+        
+        // Afficher la vidéo
+        if (data.video) {
+            videoFrame.src = "data:image/jpeg;base64," + data.video;
+        }
 
-            // Afficher FPS
-            fpsDisplay.innerText = `FPS: ${data.fps.toFixed(2)} | Frame: ${data.frame_nmr}`;
+        // Afficher FPS
+        fpsDisplay.innerText = `FPS: ${data.fps.toFixed(2)} | Frame: ${data.frame_nmr}`;
 
-            // Mettre à jour le tableau
-            tableBody.innerHTML = "";
-            data.detections.forEach(det => {
-                const row = document.createElement("tr");
+        // Mettre à jour le tableau
+        tableBody.innerHTML = "";
+        data.detections.forEach(det => {
+            const row = document.createElement("tr");
 
-                const carIdCell = document.createElement("td");
-                carIdCell.textContent = det.car_id;
-                row.appendChild(carIdCell);
+            const carIdCell = document.createElement("td");
+            carIdCell.textContent = det.car_id;
+            row.appendChild(carIdCell);
 
-                const carIdCellScore = document.createElement("td");
-                carIdCellScore.textContent = det.license_plate_bbox_score;
-                row.appendChild(carIdCellScore);
+            const carScoreCell = document.createElement("td");
+            carScoreCell.textContent = det.car_detection_score;
+            row.appendChild(carScoreCell);
 
-                const plateCell = document.createElement("td");
-                plateCell.textContent = det.license_number;
-                row.appendChild(plateCell);
+            const plateCell = document.createElement("td");
+            plateCell.textContent = det.license_number || "N/A";
+            row.appendChild(plateCell);
 
-                const plateCellScore = document.createElement("td");
-                plateCellScore.textContent = det.license_number_score;
-                row.appendChild(plateCellScore);
+            const plateScoreCell = document.createElement("td");
+            plateScoreCell.textContent = det.license_number_score || 0;
+            row.appendChild(plateScoreCell);
 
-                tableBody.appendChild(row);
-            });
-        };
+            tableBody.appendChild(row);
+        });
+    };
 
-        ws.onclose = () => {
-            console.log("Déconnecté du serveur WebSocket");
-        };
-    </script>
+    ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+    };
+
+    ws.onclose = () => {
+        console.log("Déconnecté du serveur WebSocket");
+    };
+</script>
+
 </body>
 </html>
