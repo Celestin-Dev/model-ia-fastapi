@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Float, DateTime, text
 from sqlalchemy.sql import func
 from database import Base
 
@@ -16,6 +16,7 @@ class CarDetection(Base):
     bbox_y = Column(Float, nullable=False)
     bbox_w = Column(Float, nullable=False)
     bbox_h = Column(Float, nullable=False)
+    # timestamp = Column(DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP'))
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     def __repr__(self):

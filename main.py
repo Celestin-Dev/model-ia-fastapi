@@ -45,64 +45,74 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
     # Dictionnaire classes COCO
     COCO_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
+    # Préparer les bbox pour SORT
+    sort_input = []
+
     for detection in detections.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = detection
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         y_center = int((y1 + y2) / 2)
         x_center = int((x1 + x2) / 2)
 
+        # 🔹 Garder ta logique originale
         if int(class_id) in vehicles and y_center > line_position:
-            vehicle_id = f"{x1}_{y1}_{x2}_{y2}"
-            current_detections.add(vehicle_id)
+            current_detections.add(f"{x1}_{y1}_{x2}_{y2}")
 
-            # Nouveau véhicule
-            if vehicle_id not in previous_detections:
+            # Dessiner bordure et nouveau véhicule
+            if f"{x1}_{y1}_{x2}_{y2}" not in previous_detections:
                 vehicle_count += 1
                 cv2.putText(frame, "NEW", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-            # Dessiner bordure
             draw_border(frame, (x1, y1), (x2, y2), (0, 255, 0), 25, line_length_x=200, line_length_y=200)
-            detections_.append([x1, y1, x2, y2, score])
 
-            # Calcul de la vitesse
-            speed_px = 0.0
-            if vehicle_id in vehicle_positions:
-                prev_x, prev_y, prev_time = vehicle_positions[vehicle_id]
-                dt = time.time() - prev_time
-                dx = x_center - prev_x
-                dy = y_center - prev_y
-                speed_px_new = ((dx**2 + dy**2)**0.5) / dt if dt > 0 else 0
-                # Stabilisation vitesse avec moyenne glissante
-                prev_speed = vehicle_speeds.get(vehicle_id, 0.0)
-                speed_px = 0.7 * prev_speed + 0.3 * speed_px_new
-                vehicle_speeds[vehicle_id] = speed_px
+            # Ajouter bbox pour SORT
+            sort_input.append([x1, y1, x2, y2, score])
 
-            vehicle_positions[vehicle_id] = (x_center, y_center, time.time())
+    # 🔹 Tracker avec SORT
+    track_ids = mot_tracker.update(np.asarray(sort_input))
 
-            # Conversion pixels/sec -> Km/h
-            pixel_to_meter = 0.05
-            speed_kmh = speed_px * pixel_to_meter * 3.6
+    # 🔹 Calcul de la vitesse et affichage
+    for i, track in enumerate(track_ids):
+        x1, y1, x2, y2, track_id = track
+        x1, y1, x2, y2, track_id = int(x1), int(y1), int(x2), int(y2), int(track_id)
+        x_center = (x1 + x2) // 2
+        y_center = (y1 + y2) // 2
 
-            # Récupérer la classe du véhicule
-            vehicle_class_name = COCO_CLASSES.get(int(class_id), "unknown")
+        # Calcul vitesse stable
+        speed_px = 0.0
+        if track_id in vehicle_positions:
+            prev_x, prev_y, prev_time = vehicle_positions[track_id]
+            dt = time.time() - prev_time
+            dx = x_center - prev_x
+            dy = y_center - prev_y
+            speed_px_new = ((dx**2 + dy**2)**0.5) / dt if dt > 0 else 0
+            prev_speed = vehicle_speeds.get(track_id, 0.0)
+            speed_px = 0.7 * prev_speed + 0.3 * speed_px_new
+            vehicle_speeds[track_id] = speed_px
 
-            # Affichage classe + vitesse
-            cv2.putText(frame, f"{vehicle_class_name} {speed_kmh:.1f} km/h", (x1, y1 - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        vehicle_positions[track_id] = (x_center, y_center, time.time())
+
+        # Conversion pixels/sec -> km/h
+        pixel_to_meter = 0.01
+        speed_kmh = speed_px * pixel_to_meter * 3.6
+
+        # Récupérer classe
+        class_id = int(detections.boxes.data[i][5])  # correspondance avec bbox
+        vehicle_class_name = COCO_CLASSES.get(class_id, "unknown")
+
+        # Affichage classe + vitesse
+        cv2.putText(frame, f"{vehicle_class_name} {speed_kmh:.1f} km/h", (x1, y1 - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     previous_detections.clear()
     previous_detections.update(current_detections)
 
-    # Tracking SORT
-    track_ids = mot_tracker.update(np.asarray(detections_))
-
-    # Détection plaques
+    # 🔹 Détection plaques
     license_plates = license_plate_detector(frame)[0]
     for license_plate in license_plates.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = license_plate
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        center_y_plate = (y1 + y2) / 2
+        center_y_plate = (y1 + y2) // 2
         if center_y_plate >= line_position:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             xcar1, ycar1, xcar2, ycar2, car_id = get_car(license_plate, track_ids)
@@ -124,7 +134,7 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
                     }
                     results.append(detected_cars[car_id])
 
-    # Réafficher les infos déjà connues
+    # 🔹 Réaffichage des infos déjà connues
     for cid, car in detected_cars.items():
         x1, y1, x2, y2 = car['car_bbox']
         plate = car['license_number']
@@ -139,6 +149,8 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
     return frame, results, vehicle_count
 
 
+
+
 async def generate_detections(video_path="sample.mp4"):
     coco_model, license_plate_detector = init_models()
     mot_tracker = Sort()
@@ -149,6 +161,7 @@ async def generate_detections(video_path="sample.mp4"):
 
     vehicle_count = 0
     previous_detections = set()
+    frame_skip = 2  # traiter 1 frame sur 2
 
     frame_nmr = 0
     start_time = time.time()
@@ -160,17 +173,22 @@ async def generate_detections(video_path="sample.mp4"):
             break
 
         frame_nmr += 1
+        if frame_nmr % frame_skip != 0:
+            continue
+
+        # YOLO peut traiter une version réduite si besoin
+        # small_frame = cv2.resize(frame, (320, 180))
+        # frame, detections, vehicle_count = process_frame(small_frame, ...)
+
         frame, detections, vehicle_count = process_frame(
             frame, coco_model, license_plate_detector, vehicles, mot_tracker,
             previous_detections, vehicle_count
         )
 
-        # calcul FPS
         frame_count += 1
         elapsed = time.time() - start_time
         fps = frame_count / elapsed if elapsed > 0 else 0
 
-        # compression
         frame_resized = cv2.resize(frame, (640, 360))
         _, buffer = cv2.imencode('.jpg', frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         frameb64 = base64.b64encode(buffer).decode("utf-8")
@@ -184,9 +202,10 @@ async def generate_detections(video_path="sample.mp4"):
             "all_detected_cars": list(detected_cars.values())
         }
 
-        await asyncio.sleep(1/30)
+        await asyncio.sleep(0)  # ne bloque pas l'event loop
 
     cap.release()
+
 
 
 app = FastAPI()
@@ -219,7 +238,7 @@ def read_vehicle_by_plate(license_plate: str, license_plate_score:float, timesta
 
 
 @app.get("/vehicle/search/detail")
-def read_details_vehicle(license_plate: str, car_id: int, date_start: str, date_end:str, db: Session = Depends(get_db)):
+def read_details_vehicle(license_plate: str, date_start: str, date_end:str, db: Session = Depends(get_db)):
     details = get_info_vehicle_by_nplate_car_id_datedetection(db, license_plate, date_start ,date_end)
     if not details:
         return {"message": "Aucun détail trouvé pour ce véhicule."}

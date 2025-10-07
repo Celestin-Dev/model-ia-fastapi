@@ -2,14 +2,21 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 
+# DB_USER= "root"
+# DB_PASSWORD = ""
+# DB_HOST = "localhost"
+# DB_PORT = 3306
+# DB_NAME = "vehicule_db"
+
 DB_USER= "root"
-DB_PASSWORD = ""
-DB_HOST = "localhost"
+DB_PASSWORD = "WwNNzdZVEvOTCsaIWrbtokFYpvEqzJhQ"
+DB_HOST = "mysql.railway.internal"
 DB_PORT = 3306
-DB_NAME = "vehicule_db"
+DB_NAME = "railway"
 
 # URL de connexion MySQL (adapter avec tes infos)
-DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = "mysql+pymysql://root:WwNNzdZVEvOTCsaIWrbtokFYpvEqzJhQ@metro.proxy.rlwy.net:31527/railway"
 
 # Créer l'engine
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)

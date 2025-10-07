@@ -1,16 +1,18 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from model import CarDetection
-from datetime import datetime
+from datetime import datetime, timedelta
 
 def save_detection(db: Session, car_id: int, car_detection_score: float, license_plate: str, license_plate_score: float, bbox: list, car_class:str, car_speed):
+    license_plate_score = round(license_plate_score, 2)
+    car_detection_score = round(car_detection_score, 2)
     detection = CarDetection(
         car_id=car_id,
         car_detection_score=car_detection_score,
         license_plate=license_plate,
         license_plate_score=license_plate_score,
-        car_class = car_class,
-        car_speed = car_speed,
+        car_class=car_class,
+        car_speed=car_speed,
         bbox_x=bbox[0],
         bbox_y=bbox[1],
         bbox_w=bbox[2]-bbox[0],
@@ -21,21 +23,26 @@ def save_detection(db: Session, car_id: int, car_detection_score: float, license
     db.refresh(detection)
     return detection
 
-def get_vehicle_by_number_plate(db: Session, license_plate: str, license_plate_score:float, timestamp:str):
+def get_vehicle_by_number_plate(db: Session, license_plate: str, license_plate_score: float, timestamp:str):
     date = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+
+    start = date - timedelta(seconds=1)
+    end = date + timedelta(seconds=1)
+    epsilon = 0.01
     return db.query(CarDetection).filter(
         CarDetection.license_plate == license_plate,
-        CarDetection.license_plate_score == license_plate_score,
-        CarDetection.timestamp == date 
-        ).all()
+        CarDetection.license_plate_score.between(license_plate_score - epsilon, license_plate_score + epsilon),
+        CarDetection.timestamp.between(start, end)
+    ).all()
+
 
 def get_info_vehicle_by_nplate_car_id_datedetection(db: Session, license_plate: str, date_start: str, date_end:str):
     try:
-        start = datetime.fromisoformat(date_start)
-        end = datetime.fromisoformat(date_end)
+        start = datetime.strptime(date_start, "%Y-%m-%d %H:%M:%S")
+        end = datetime.strptime(date_end, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
-
+    epsilon = 0.01
     query = db.query(
         CarDetection.license_plate,
         CarDetection.license_plate_score,
