@@ -13,12 +13,16 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 from model import Base
 from detection import *
+from concurrent.futures import ThreadPoolExecutor
 
 # mémoire globale
 detected_cars = {}
 vehicle_positions = {}
 vehicle_speeds = {}
 
+executor = ThreadPoolExecutor(max_workers=4)
+
+# initialisation des modèles
 def init_models():
     coco_model = YOLO('yolov8n.pt')
     license_plate_detector = YOLO('license_plate_detector.pt')
@@ -129,8 +133,9 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
 
     return frame, results, vehicle_count
 
+
+coco_model, license_plate_detector = init_models()
 async def generate_detections(video_path="sample.mp4"):
-    coco_model, license_plate_detector = init_models()
     mot_tracker = Sort()
     vehicles = [2, 3, 5, 7]
     cap = cv2.VideoCapture(video_path)
@@ -154,10 +159,7 @@ async def generate_detections(video_path="sample.mp4"):
         if frame_nmr % frame_skip != 0:
             continue
 
-        # réduiire la taille de la frame pour accélérer le traitement
-        # small_frame = cv2.resize(frame, (320, 180))
-
-        frame, detections, vehicle_count = process_frame(
+        frame, detections, vehicle_count = await asyncio.to_thread(process_frame,
             frame, coco_model, license_plate_detector, vehicles, mot_tracker,
             previous_detections, vehicle_count
         )
@@ -222,7 +224,7 @@ async def detection_producer(video_path="sample.mp4"):
             try:
                 for det in result.get("detections", []):
                     try:
-                        save_detection(
+                        await asyncio.to_thread(save_detection,
                             db,
                             det["car_id"],
                             det["car_detection_score"],
