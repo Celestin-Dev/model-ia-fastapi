@@ -1,8 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
 ultralytics
 opencv-python-headless
 sqlalchemy
 pydantic
 pymysql
 python-dotenv
+psycopg2-binary
