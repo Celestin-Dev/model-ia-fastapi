@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, text
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
 from sqlalchemy.sql import func
 from database import Base
 
@@ -16,8 +16,17 @@ class CarDetection(Base):
     bbox_y = Column(Float, nullable=False)
     bbox_w = Column(Float, nullable=False)
     bbox_h = Column(Float, nullable=False)
-    # timestamp = Column(DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP'))
+    offense = Column(Boolean, default=False, nullable=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
 
     def __repr__(self):
         return f"<CarDetection(id={self.id}, car_id={self.car_id}, license_plate={self.license_plate})>"
+    
+class Notification(Base):
+    __tablename__="notification"
+    id = Column(Integer, primary_key=True, index=True)
+    car_id = Column(Integer, index=True, nullable=False)
+    title = Column(String(100))
+    is_read = Column(Boolean, default=False)
+    event_time = Column(DateTime(timezone=True), nullable=False)

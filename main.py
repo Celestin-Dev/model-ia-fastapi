@@ -34,7 +34,7 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
 
     results = []
     detections = coco_model(frame)[0]
-    detections_ = []
+    #detections_ = []
     current_detections = set()
 
     # Ligne de comptage (60% de la hauteur)
@@ -54,31 +54,28 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
         y_center = int((y1 + y2) / 2)
         x_center = int((x1 + x2) / 2)
 
-        # 🔹 Garder ta logique originale
         if int(class_id) in vehicles and y_center > line_position:
             current_detections.add(f"{x1}_{y1}_{x2}_{y2}")
 
             # Dessiner bordure et nouveau véhicule
             if f"{x1}_{y1}_{x2}_{y2}" not in previous_detections:
                 vehicle_count += 1
-                cv2.putText(frame, "NEW", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             draw_border(frame, (x1, y1), (x2, y2), (0, 255, 0), 25, line_length_x=200, line_length_y=200)
 
             # Ajouter bbox pour SORT
             sort_input.append([x1, y1, x2, y2, score])
 
-    # 🔹 Tracker avec SORT
+    # Tracker avec SORT
     track_ids = mot_tracker.update(np.asarray(sort_input))
 
-    # 🔹 Calcul de la vitesse et affichage
+    # Calcul de la vitesse et affichage
     for i, track in enumerate(track_ids):
         x1, y1, x2, y2, track_id = track
         x1, y1, x2, y2, track_id = int(x1), int(y1), int(x2), int(y2), int(track_id)
         x_center = (x1 + x2) // 2
         y_center = (y1 + y2) // 2
 
-        # Calcul vitesse stable
+        # Calcul vitesse
         speed_px = 0.0
         if track_id in vehicle_positions:
             prev_x, prev_y, prev_time = vehicle_positions[track_id]
@@ -92,22 +89,18 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
 
         vehicle_positions[track_id] = (x_center, y_center, time.time())
 
-        # Conversion pixels/sec -> km/h
+        # Conversion pixels/sec
         pixel_to_meter = 0.01
         speed_kmh = speed_px * pixel_to_meter * 3.6
 
         # Récupérer classe
-        class_id = int(detections.boxes.data[i][5])  # correspondance avec bbox
+        class_id = int(detections.boxes.data[i][5])
         vehicle_class_name = COCO_CLASSES.get(class_id, "unknown")
-
-        # Affichage classe + vitesse
-        cv2.putText(frame, f"{vehicle_class_name} {speed_kmh:.1f} km/h", (x1, y1 - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     previous_detections.clear()
     previous_detections.update(current_detections)
 
-    # 🔹 Détection plaques
+    #Détection plaques
     license_plates = license_plate_detector(frame)[0]
     for license_plate in license_plates.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = license_plate
@@ -130,38 +123,23 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
                         'license_number': license_plate_text,
                         'license_number_score': float(license_plate_text_score),
                         'speed_kmh': speed_kmh,
-                        'vehicle_class': vehicle_class_name
+                        'vehicle_class': vehicle_class_name,
                     }
                     results.append(detected_cars[car_id])
 
-    # 🔹 Réaffichage des infos déjà connues
-    for cid, car in detected_cars.items():
-        x1, y1, x2, y2 = car['car_bbox']
-        plate = car['license_number']
-        vehicle_class_name = car.get('vehicle_class', 'unknown')
-        cv2.putText(frame, f"ID:{cid} {vehicle_class_name} Plate:{plate}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-    # Affichage compteur véhicules
-    cv2.putText(frame, f'Nombre total de vehicules: {vehicle_count}', (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-
     return frame, results, vehicle_count
-
-
-
 
 async def generate_detections(video_path="sample.mp4"):
     coco_model, license_plate_detector = init_models()
     mot_tracker = Sort()
-    vehicles = [2, 3, 5, 7]  # car, motorbike, bus, truck
+    vehicles = [2, 3, 5, 7]
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
 
     vehicle_count = 0
     previous_detections = set()
-    frame_skip = 2  # traiter 1 frame sur 2
+    frame_skip = 2 
 
     frame_nmr = 0
     start_time = time.time()
@@ -176,9 +154,8 @@ async def generate_detections(video_path="sample.mp4"):
         if frame_nmr % frame_skip != 0:
             continue
 
-        # YOLO peut traiter une version réduite si besoin
+        # réduiire la taille de la frame pour accélérer le traitement
         # small_frame = cv2.resize(frame, (320, 180))
-        # frame, detections, vehicle_count = process_frame(small_frame, ...)
 
         frame, detections, vehicle_count = process_frame(
             frame, coco_model, license_plate_detector, vehicles, mot_tracker,
@@ -202,13 +179,28 @@ async def generate_detections(video_path="sample.mp4"):
             "all_detected_cars": list(detected_cars.values())
         }
 
-        await asyncio.sleep(0)  # ne bloque pas l'event loop
+        await asyncio.sleep(0) 
 
     cap.release()
 
 
-
+from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
+connected_clients = []
+
+# --- Globals ---
+video_clients: list[WebSocket] = []          
+notif_clients: list[WebSocket] = []          
+detection_queue: asyncio.Queue = asyncio.Queue()
+
 Base.metadata.create_all(bind=engine)
 
 # Dependency DB
@@ -219,14 +211,103 @@ def get_db():
     finally:
         db.close()
 
+# ---------------------------
+# Producteur de détections : lit la vidéo, traite les frames et met les résultats dans la queue
+# ---------------------------
 
+async def detection_producer(video_path="sample.mp4"):
+    try:
+        async for result in generate_detections(video_path):
+            db = SessionLocal()
+            try:
+                for det in result.get("detections", []):
+                    try:
+                        save_detection(
+                            db,
+                            det["car_id"],
+                            det["car_detection_score"],
+                            det.get("license_number"),
+                            det.get("license_number_score", 0.0),
+                            det.get("car_bbox"),
+                            det.get("vehicle_class"),
+                            det.get("speed_kmh", 0.0)
+                        )
+                    except Exception as ex:
+                        print("Erreur save_detection:", ex)
+                await detection_queue.put(result)
+            finally:
+                db.close()
+    except Exception as e:
+        print("Erreur dans detection_producer:", e)
+    finally:
+        print("detection_producer termine")
+
+# ---------------------------
+# Background broadcaster: lit la queue et envoie à tous les clients video
+# ---------------------------
+async def detection_broadcaster():
+    while True:
+        result = await detection_queue.get()
+        to_remove = []
+        for ws in video_clients:
+            try:
+                await ws.send_json(result)
+            except Exception:
+                to_remove.append(ws)
+        for ws in to_remove:
+            if ws in video_clients:
+                video_clients.remove(ws)
+        detection_queue.task_done()
+
+# ---------------------------
+# WebSocket endpoint for video (/ws)
+# ---------------------------
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
+async def websocket_video(websocket: WebSocket):
     await websocket.accept()
-    async for result in generate_detections("sample.mp4"):
-        for det in result["detections"]:
-            save_detection(db, det["car_id"], det["car_detection_score"], det["license_number"], det["license_number_score"], det["car_bbox"], det["vehicle_class"], det["speed_kmh"])
-        await websocket.send_json(result)
+    video_clients.append(websocket)
+    print("Client vidéo connecté, total:", len(video_clients))
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except Exception as e:
+        print("websocket_video erreur:", e)
+    finally:
+        if websocket in video_clients:
+            video_clients.remove(websocket)
+        await websocket.close()
+        print("Client vidéo déconnecté")
+
+# # ---------------------------
+# # WebSocket endpoint for notifications
+# # ---------------------------
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket):
+    await websocket.accept()
+    notif_clients.append(websocket)
+    print("Client notif connecté, total:", len(notif_clients))
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except Exception as e:
+        print("websocket_notifications erreur:", e)
+    finally:
+        if websocket in notif_clients:
+            notif_clients.remove(websocket)
+        await websocket.close()
+        print("Client notif déconnecté")
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(detection_producer("sample.mp4"))
+    asyncio.create_task(detection_broadcaster())
+    asyncio.create_task(monitor_offenses(notif_clients))
+
+# API Endpoints: sauvegarde les détections, récupère véhicules et notifications
+@app.get("/save")
+async def save_notif(db: Session = Depends(get_db)):
+    return await save_notification(db)
 
 
 @app.get("/vehicle")
@@ -235,7 +316,6 @@ def read_vehicle_by_plate(license_plate: str, license_plate_score:float, timesta
     if not vehicle:
         return {"message": f"Véhicule avec la plaque {license_plate} introuvable"}
     return vehicle
-
 
 @app.get("/vehicle/search/detail")
 def read_details_vehicle(license_plate: str, date_start: str, date_end:str, db: Session = Depends(get_db)):
@@ -255,77 +335,15 @@ def read_recent_vehicles(limit: int = 5, db: Session = Depends(get_db)):
     vehicles = getLastVehicles(db, limit)
     return vehicles
 
-@app.get("/vehicles/last5_per_car")
-def read_last_five_per_car(db: Session = Depends(get_db)):
-    return get_last_five_per_car(db)
 
 @app.get("/vehicles/best_per_car")
 def read_best_detection_per_car(db: Session = Depends(get_db)):
     return get_best_detection_per_car(db)
 
+@app.get("/notifications")
+def read_notifications(db: Session = Depends(get_db)):
+    return get_all_notifications(db)
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from av import VideoFrame
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
-)
-
-class CameraStream(VideoStreamTrack):
-    def __init__(self, source=0):
-        super().__init__()
-        self.cap = cv2.VideoCapture(source)
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-        ret, frame = self.cap.read()
-        if not ret:
-            await asyncio.sleep(0.1)
-            return None
-        frame = cv2.resize(frame, (640, 360))
-        av_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        av_frame.pts = pts
-        av_frame.time_base = time_base
-        return av_frame
-
-# Route d’offre WebRTC
-from aiortc.contrib.media import MediaPlayer
-import os
-pcs = set()
-
-@app.post("/offer")
-async def offer(request: Request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-
-    pc = RTCPeerConnection()
-    pcs.add(pc)
-
-    # --- choisir une source vidéo ---
-    video_source = "sample.mp4"
-    if not os.path.exists(video_source):
-        video_source = 0  # utiliser webcam locale si pas de fichier
-
-    player = MediaPlayer(video_source)
-
-    if player.video:  # sécurise l’ajout
-        pc.addTrack(player.video)
-    if player.audio:
-        pc.addTrack(player.audio)
-
-    # --- WebRTC handshake ---
-    await pc.setRemoteDescription(offer)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    return {
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type,
-    }
 
 import uvicorn
 if __name__== "__main__":

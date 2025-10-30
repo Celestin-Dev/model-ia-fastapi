@@ -6,3 +6,5 @@ venv/
 .env/
 env/
 *.pyc   
+index.html
+.env

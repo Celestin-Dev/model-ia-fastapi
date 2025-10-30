@@ -30,6 +30,13 @@
             height: auto;
             border: 2px solid #000;
         }
+        #notif-container {
+            margin-top: 20px;
+        }
+        #notif-list p {
+            margin: 0;
+            padding: 2px 0;
+        }
     </style>
 </head>
 <body>
@@ -38,6 +45,13 @@
         <img id="video-frame" src="">
         <div id="fps"></div>
         <div id="vehicle-count">Véhicules détectés: 0</div>
+        <div id="log"></div>
+
+        <!-- Section notifications -->
+        <div id="notif-container">
+            <h3>🔔 Notifications infractions</h3>
+            <div id="notif-list"></div>
+        </div>
     </div>
 
     <div id="table-container">
@@ -57,64 +71,52 @@
     </div>
 
     <script>
-    // Connecter au serveur WebSocket
+    // --- WebSocket pour flux vidéo et détection ---
     const ws = new WebSocket("ws://localhost:8000/ws");
-
     const videoFrame = document.getElementById("video-frame");
     const fpsDisplay = document.getElementById("fps");
     const tableBody = document.getElementById("table-body");
 
-    ws.onopen = () => {
-        console.log("Connecté au serveur WebSocket");
-    };
-
+    ws.onopen = () => console.log("Connecté au serveur WebSocket (vidéo)");
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-
-        console.log(data);
         document.getElementById("vehicle-count").textContent = `Véhicules détectés: ${data.vehicle_count}`;
         
-        // Afficher la vidéo
         if (data.video) {
             videoFrame.src = "data:image/jpeg;base64," + data.video;
         }
 
-        // Afficher FPS
         fpsDisplay.innerText = `FPS: ${data.fps.toFixed(2)} | Frame: ${data.frame_nmr}`;
 
-        // Mettre à jour le tableau
         tableBody.innerHTML = "";
         data.detections.forEach(det => {
             const row = document.createElement("tr");
-
-            const carIdCell = document.createElement("td");
-            carIdCell.textContent = det.car_id;
-            row.appendChild(carIdCell);
-
-            const carScoreCell = document.createElement("td");
-            carScoreCell.textContent = det.car_detection_score;
-            row.appendChild(carScoreCell);
-
-            const plateCell = document.createElement("td");
-            plateCell.textContent = det.license_number || "N/A";
-            row.appendChild(plateCell);
-
-            const plateScoreCell = document.createElement("td");
-            plateScoreCell.textContent = det.license_number_score || 0;
-            row.appendChild(plateScoreCell);
-
+            row.innerHTML = `
+                <td>${det.car_id}</td>
+                <td>${det.car_detection_score}</td>
+                <td>${det.license_number || "N/A"}</td>
+                <td>${det.license_number_score || 0}</td>
+            `;
             tableBody.appendChild(row);
         });
     };
+    ws.onerror = (error) => console.error("WebSocket error:", error);
+    ws.onclose = () => console.log("Déconnecté du serveur WebSocket (vidéo)");
 
-    ws.onerror = (error) => {
-        console.error("WebSocket error:", error);
+
+    // --- WebSocket pour notifications d'infractions ---
+    const wsNotif = new WebSocket("ws://localhost:8000/ws/notifications");
+    const notifList = document.getElementById("notif-list");
+
+    wsNotif.onopen = () => console.log("Connecté au serveur WebSocket (notifications)");
+    wsNotif.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const p = document.createElement("p");
+        p.textContent = `🚨 Véhicule ${data.car_id} - ${data.title} à ${data.created_at}`;
+        notifList.prepend(p); // Ajouter en haut pour voir les plus récentes
     };
-
-    ws.onclose = () => {
-        console.log("Déconnecté du serveur WebSocket");
-    };
-</script>
-
+    wsNotif.onerror = (error) => console.error("WebSocket notifications error:", error);
+    wsNotif.onclose = () => console.log("Déconnecté du serveur WebSocket (notifications)");
+    </script>
 </body>
 </html>
