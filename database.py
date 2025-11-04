@@ -15,8 +15,8 @@ DB_NAME = "vehicule_db"
 # DB_NAME = "railway"
 
 # URL de connexion MySQL (adapter avec tes infos)
-# DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-DATABASE_URL = "postgresql://neondb_owner:npg_yIkoGPS9xp0H@ep-proud-resonance-advta1gn-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# DATABASE_URL = "postgresql://neondb_owner:npg_yIkoGPS9xp0H@ep-proud-resonance-advta1gn-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 #DATABASE_URL = "mysql+pymysql://root:WwNNzdZVEvOTCsaIWrbtokFYpvEqzJhQ@metro.proxy.rlwy.net:31527/railway"
 
 # Créer l'engine

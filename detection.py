@@ -1,10 +1,19 @@
+import base64
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, and_
 from model import CarDetection, Notification
 from datetime import datetime, timedelta
 import asyncio
 
-def save_detection(db: Session, car_id: int, car_detection_score: float, license_plate: str, license_plate_score: float, bbox: list, car_class:str, car_speed):
+def save_detection(db: Session, car_id: int, 
+                   car_detection_score: float, 
+                   license_plate: str, 
+                   license_plate_score: float, 
+                   bbox: list, car_class:str, 
+                   car_speed: float, 
+                   vehicle_color:str,
+                   image_data: bytes = None,
+                   ):
     license_plate_score = round(license_plate_score, 2)
     car_detection_score = round(car_detection_score, 2)
     detection = CarDetection(
@@ -18,7 +27,9 @@ def save_detection(db: Session, car_id: int, car_detection_score: float, license
         bbox_x=bbox[0],
         bbox_y=bbox[1],
         bbox_w=bbox[2]-bbox[0],
-        bbox_h=bbox[3]-bbox[1]
+        bbox_h=bbox[3]-bbox[1],
+        vehicle_color=vehicle_color,
+        image_capture=image_data
     )
     db.add(detection)
     db.commit()
@@ -187,7 +198,8 @@ def get_best_detection_per_car(db: Session):
         {
             "license_plate": row.license_plate,
             "license_plate_score": row.license_plate_score,
-            "timestamp": row.timestamp
+            "timestamp": row.timestamp,
+            "image_capture": base64.b64encode(row.image_capture).decode("utf-8") if row.image_capture else None
         }
         for row in query
     ]
@@ -212,3 +224,49 @@ def get_last_overspeed_detections(db: Session, limit_speed: float = 80.0):
     )
 
     return result
+
+
+# Get total number of detections
+def get_total_unique_vehicles(db: Session):
+    latest_subq = (
+        db.query(
+            CarDetection.car_id.label("car_id"),
+            func.max(CarDetection.timestamp).label("max_ts")
+        )
+        .group_by(CarDetection.car_id)
+        .subquery()
+    )
+
+    # On joint la table principale avec la sous-requête pour ne garder que la ligne "dernière" par car_id
+    latest_records_q = (
+        db.query(CarDetection)
+        .join(
+            latest_subq,
+            and_(
+                CarDetection.car_id == latest_subq.c.car_id,
+                CarDetection.timestamp == latest_subq.c.max_ts
+            )
+        )
+        .subquery()  # représente l'ensemble des enregistrements représentatifs (une ligne par car_id)
+    )
+
+    # Maintenant, compter par class à partir de ces lignes représentatives
+    results = (
+        db.query(
+            latest_records_q.c.car_class,
+            func.count(latest_records_q.c.car_id).label("unique_vehicle_count")
+        )
+        .group_by(latest_records_q.c.car_class)
+        .all()
+    )
+
+    # Total global = nombre de lignes dans latest_records_q (une ligne par car_id)
+    total_unique = db.query(func.count(latest_records_q.c.car_id)).scalar()
+
+    return {
+        "total_unique_vehicles": total_unique,
+        "details_by_class": [
+            {"car_class": car_class, "unique_vehicle_count": count}
+            for car_class, count in results
+        ]
+    }

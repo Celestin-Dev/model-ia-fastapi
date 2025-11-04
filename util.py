@@ -131,3 +131,76 @@ def draw_border(img, top_left, bottom_right, color=(0, 255, 0), thickness=10, li
     cv2.line(img, (x2, y2), (x2 - line_length_x, y2), color, thickness)
 
     return img
+
+
+
+
+# Conversion BGR vers Nom de Couleur
+def get_color_name(bgr_color):
+    """
+    Convertit une couleur BGR en un nom de couleur simplifié (via HSV).
+    """
+    # Convertir le pixel BGR en une image 1x1 pour cvtColor
+    bgr_color_pixel = np.uint8([[bgr_color]])
+    hsv_color_pixel = cv2.cvtColor(bgr_color_pixel, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv_color_pixel[0][0]
+
+    # Définir les seuils HSV pour les couleurs communes
+    if v < 50:
+        return "Noir"
+    if s < 50 and v > 180:
+        return "Blanc"
+    if s < 50 and v < 180:
+        return "Gris"
+
+    if (h < 10 or h > 160):
+        return "Rouge"
+    if 10 <= h < 25:
+        return "Orange"
+    if 25 <= h < 35:
+        return "Jaune"
+    if 35 <= h < 85:
+        return "Vert"
+    if 85 <= h < 130:
+        return "Bleu"
+    if 130 <= h < 145:
+        return "Violet"
+    if 145 <= h < 160:
+        return "Rose"
+        
+    return "Inconnu"
+
+
+# Extraction de la Couleur Dominante (K-Means)
+def get_dominant_color(image_crop, k=4):
+    """
+    Trouve la couleur dominante dans un crop d'image en utilisant K-Means.
+    Retourne un nom de couleur.
+    """
+    try:
+        # Redimensionner pour accélérer le K-Means
+        image = cv2.resize(image_crop, (50, 50), interpolation=cv2.INTER_AREA)
+
+        # Convertir en un tableau de pixels (N, 3)
+        pixels = image.reshape((-1, 3))
+        pixels = np.float32(pixels)
+
+        # Définir les critères et exécuter K-Means
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        compactness, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+        # Trouver le cluster le plus fréquent (la couleur dominante)
+        labels = labels.flatten()
+        counts = np.bincount(labels)
+        dominant_cluster_index = np.argmax(counts)
+        dominant_bgr_color = centers[dominant_cluster_index]
+
+        # Convertir la couleur BGR en nom
+        color_name = get_color_name(dominant_bgr_color)
+        
+        return color_name
+        
+    except Exception as e:
+        print(f"Erreur K-Means (couleur): {e}")
+        # Retourne "Inconnu" si l'image est trop petite ou a un format étrange
+        return "Inconnu"
