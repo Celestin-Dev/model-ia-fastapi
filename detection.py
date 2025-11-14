@@ -1,8 +1,10 @@
 import base64
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_,extract 
+from typing import Dict, Any, List, Optional
 from model import CarDetection, Notification
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import asyncio
 
 def save_detection(db: Session, car_id: int, 
@@ -13,7 +15,16 @@ def save_detection(db: Session, car_id: int,
                    car_speed: float, 
                    vehicle_color:str,
                    image_data: bytes = None,
+                   video_id: str = "",
+                   offense:bool=False
                    ):
+    global location
+    if video_id=="cam_001":
+        location = "RN7-Entrée-Nord Fianarantsoa"
+    elif video_id=="cam_002":
+        location = "RN7-Sortie-Sud Fianarantsoa"
+
+
     license_plate_score = round(license_plate_score, 2)
     car_detection_score = round(car_detection_score, 2)
     detection = CarDetection(
@@ -23,13 +34,15 @@ def save_detection(db: Session, car_id: int,
         license_plate_score=license_plate_score,
         car_class=car_class,
         car_speed=car_speed,
-        offense=car_speed > 0.30,
+        offense=offense,
         bbox_x=bbox[0],
         bbox_y=bbox[1],
         bbox_w=bbox[2]-bbox[0],
         bbox_h=bbox[3]-bbox[1],
         vehicle_color=vehicle_color,
-        image_capture=image_data
+        image_capture=image_data,
+        video_id=video_id,
+        location=location
     )
     db.add(detection)
     db.commit()
@@ -93,180 +106,304 @@ async def monitor_offenses(notif_clients: list):
             db.close()
 
 
+# Recuperer les total de detection
+def get_total_detections(db: Session) -> int:
+    return db.query(CarDetection).count()
 
-def get_all_notifications(db: Session):
-    query = db.query(Notification).order_by(Notification.event_time.desc()).all()
-    return [
-        {
-            "id": row.id,
-            "car_id": row.car_id,
-            "title": row.title,
-            "is_read": row.is_read,
-            "event_time": row.event_time
-        }
-        for row in query
-    ]
-
-
-def get_vehicle_by_number_plate(db: Session, license_plate: str, license_plate_score: float, timestamp:str):
-    date = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-
-    start = date - timedelta(seconds=1)
-    end = date + timedelta(seconds=1)
-    epsilon = 0.01
+# Recuperer les detection aujourd'hui
+def get_detections_today(db: Session) -> int:
+    today = date.today()
     return db.query(CarDetection).filter(
-        CarDetection.license_plate == license_plate,
-        CarDetection.license_plate_score.between(license_plate_score - epsilon, license_plate_score + epsilon),
-        CarDetection.timestamp.between(start, end)
-    ).first()
+        extract('year', CarDetection.timestamp) == today.year,
+        extract('month', CarDetection.timestamp) == today.month,
+        extract('day', CarDetection.timestamp) == today.day
+    ).count()
+
+# Recuperer les nombre de camera active aujourd'hui
+def get_active_cameras_today(db: Session) -> int:
+    today = date.today()
+    active_ids = db.query(CarDetection.video_id).filter(
+        extract('year', CarDetection.timestamp) == today.year,
+        extract('month', CarDetection.timestamp) == today.month,
+        extract('day', CarDetection.timestamp) == today.day
+    ).distinct().all()
+    return len(active_ids)
+
+# Recuperer les total des infractions de vitesse
+def get_total_offenses(db: Session) -> int:
+    return db.query(CarDetection).filter(CarDetection.offense == True).count()
 
 
-def get_info_vehicle_by_nplate_car_id_datedetection(db: Session, license_plate: str, date_start: str, date_end:str):
-    try:
-        start = datetime.strptime(date_start, "%Y-%m-%d %H:%M:%S")
-        end = datetime.strptime(date_end, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
-    epsilon = 0.01
-    query = db.query(
-        CarDetection.license_plate,
-        CarDetection.license_plate_score,
-        CarDetection.timestamp
-        ).filter(
-        CarDetection.license_plate == license_plate,
-        CarDetection.timestamp.between(start, end)
-    ).all()
-    return [
-        {
-            "license_plate": row.license_plate,
-            "license_plate_score": row.license_plate_score,
-            "timestamp": row.timestamp
-        }
-        for row in query
-    ]
-
-
-
-def getAllVehicles(db: Session):
-    query = db.query(
-        CarDetection.license_plate, 
-        CarDetection.timestamp
-        ).all()
-    return [
-        {
-            "license_plate": row.license_plate,
-            "timestamp": row.timestamp
-        }
-        for row in query
-    ]
-
-def getLastVehicles(db: Session, limit: int = 5):
-    query = db.query(
-        CarDetection.license_plate,
-        CarDetection.timestamp
-    ).order_by(CarDetection.timestamp.desc()).limit(limit).all()
-
-    return [
-        {
-            "license_plate": row.license_plate,
-            "timestamp": row.timestamp
-        }
-        for row in query
-    ]
-
-
-def get_stat_vehicle(db:Session):
-    data = db.query(CarDetection).filter(CarDetection.license_plate_score)
-
-def get_best_detection_per_car(db: Session):
-
-    # On récupère le maximum de license_plate_score pour chaque car_id
+# Recuperer le recent detection
+def get_recent_detections_best_score(db: Session, limit: int = 10):
     subquery = db.query(
-        CarDetection.car_id,
-        func.max(CarDetection.license_plate_score).label("max_score")
-    ).group_by(CarDetection.car_id).subquery()
-
-    # On joint avec la table principale pour récupérer toutes les infos correspondantes
-    query = db.query(CarDetection).join(
-        subquery,
-        (CarDetection.car_id == subquery.c.car_id) &
-        (CarDetection.license_plate_score == subquery.c.max_score)
-    ).all()
-
-    # Transforme en dictionnaire pour FastAPI
-    return [
-        {
-            "license_plate": row.license_plate,
-            "license_plate_score": row.license_plate_score,
-            "timestamp": row.timestamp,
-            "image_capture": base64.b64encode(row.image_capture).decode("utf-8") if row.image_capture else None
-        }
-        for row in query
-    ]
-
-
-def get_last_overspeed_detections(db: Session, limit_speed: float = 80.0):
-    subquery = (
-        db.query(
-            CarDetection.car_id,
-            func.max(CarDetection.timestamp).label("latest_time")
-        )
-        .filter(CarDetection.car_speed > limit_speed)
-        .group_by(CarDetection.car_id)
-        .subquery()
-    )
-
-    result = (
-        db.query(CarDetection)
-        .join(subquery, (CarDetection.car_id == subquery.c.car_id) &
-                        (CarDetection.timestamp == subquery.c.latest_time))
-        .all()
-    )
-
-    return result
-
-
-# Get total number of detections
-def get_total_unique_vehicles(db: Session):
-    latest_subq = (
-        db.query(
-            CarDetection.car_id.label("car_id"),
-            func.max(CarDetection.timestamp).label("max_ts")
-        )
-        .group_by(CarDetection.car_id)
-        .subquery()
-    )
-
-    # On joint la table principale avec la sous-requête pour ne garder que la ligne "dernière" par car_id
-    latest_records_q = (
-        db.query(CarDetection)
+        CarDetection.license_plate,
+        func.max(CarDetection.timestamp).label("max_timestamp")
+    ).group_by(CarDetection.license_plate).subquery()
+    recent_unique_detections = db.query(CarDetection) \
         .join(
-            latest_subq,
-            and_(
-                CarDetection.car_id == latest_subq.c.car_id,
-                CarDetection.timestamp == latest_subq.c.max_ts
-            )
-        )
-        .subquery()  # représente l'ensemble des enregistrements représentatifs (une ligne par car_id)
-    )
-
-    # Maintenant, compter par class à partir de ces lignes représentatives
-    results = (
-        db.query(
-            latest_records_q.c.car_class,
-            func.count(latest_records_q.c.car_id).label("unique_vehicle_count")
-        )
-        .group_by(latest_records_q.c.car_class)
+            subquery,
+            (CarDetection.license_plate == subquery.c.license_plate) & 
+            (CarDetection.timestamp == subquery.c.max_timestamp)
+        ) \
+        .filter(CarDetection.license_plate.isnot(None)) \
+        .order_by(CarDetection.timestamp.desc()) \
+        .limit(limit) \
         .all()
-    )
+        
+    return recent_unique_detections
 
-    # Total global = nombre de lignes dans latest_records_q (une ligne par car_id)
-    total_unique = db.query(func.count(latest_records_q.c.car_id)).scalar()
+# Rechercher par plaque d'immatriculation
+def search_license_plate(db: Session, plate_query: str, limit: int = 20) -> List[CarDetection]:
+    return db.query(CarDetection) \
+             .filter(CarDetection.license_plate.ilike(f"%{plate_query}%")) \
+             .order_by(CarDetection.timestamp.desc()) \
+             .limit(limit) \
+             .all()
+
+# Recuper une image
+def get_image_data_by_detection_id(db: Session, detection_id: int) -> bytes | None:
+    vehicle = db.query(CarDetection).filter(CarDetection.id == detection_id).first()
+
+    if not vehicle or not vehicle.image_capture:
+        return JSONResponse(status_code=404, content={"detail": "Image non trouvée"})
+
+    return Response(content=vehicle.image_capture, media_type="image/jpeg")
+
+# Recuperer le recent infraction
+def get_recent_offenses(db: Session, limit: int = 10):
+    subquery = db.query(
+        CarDetection.license_plate,
+        func.max(CarDetection.timestamp).label("max_timestamp")
+    ).filter(
+        CarDetection.offense == True, 
+        CarDetection.license_plate.isnot(None)
+    ).group_by(CarDetection.license_plate).subquery()
+
+    recent_unique_offenses = db.query(CarDetection) \
+        .join(
+            subquery,
+            (CarDetection.license_plate == subquery.c.license_plate) & 
+            (CarDetection.timestamp == subquery.c.max_timestamp)
+        ) \
+        .order_by(CarDetection.timestamp.desc()) \
+        .limit(limit) \
+        .all()
+        
+    return recent_unique_offenses
+
+# Créer une notification d'infraction
+def create_offense_notification(db: Session, car_det: CarDetection, offense_type: str):
+    license_plate = car_det.license_plate
+    if not license_plate:
+        return None
+    
+    downtime_threshold = datetime.now() - timedelta(seconds=30)
+
+    existing_notif = db.query(Notification) \
+        .join(CarDetection, Notification.car_id == CarDetection.id) \
+        .filter(
+            CarDetection.license_plate == license_plate,
+            Notification.event_time > downtime_threshold  
+        ) \
+        .first()
+    if existing_notif:
+        return None
+    
+
+    car_det_id = car_det.id 
+
+    title = f"Infraction détectée:Plaque {license_plate}"
+
+    new_notification = Notification(
+        car_id=car_det_id,
+        title=title,
+        event_time=car_det.timestamp, 
+        is_read=False
+    )
+    
+    db.add(new_notification)
+    db.commit()
+    db.refresh(new_notification)
+    
+    ws_data = {
+        "id": new_notification.id,
+        "title": new_notification.title,
+        "event_time": new_notification.event_time.isoformat(),
+        "license_plate": car_det.license_plate,
+        "location": car_det.location,
+        "car_image_url": f"/api/images/{car_det.id}"
+    }
+    return ws_data
+
+
+def get_car_detection_by_id(db: Session, car_id: int) -> CarDetection | None:
+    car_detection = db.query(CarDetection) \
+        .filter(CarDetection.car_id == car_id) \
+        .order_by(CarDetection.timestamp.desc()) \
+        .first()
+
+    return car_detection
+
+
+# Distribuer par chaque camera
+def get_detection_volume_by_camera(db: Session, period: str = "today") -> List[Dict[str, Any]]:
+    query = db.query(
+        CarDetection.video_id, 
+        func.count(CarDetection.id).label("total_detections")
+    ).filter(CarDetection.video_id.isnot(None))
+    
+    
+    if period == "today":
+        today = date.today()
+        query = query.filter(
+            extract('year', CarDetection.timestamp) == today.year,
+            extract('month', CarDetection.timestamp) == today.month,
+            extract('day', CarDetection.timestamp) == today.day
+        )
+    
+    elif period == "week":
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        query = query.filter(CarDetection.timestamp >= seven_days_ago)
+        
+    elif period == "month":
+        first_day_of_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        query = query.filter(CarDetection.timestamp >= first_day_of_month)
+    
+    camera_counts = query \
+        .group_by(CarDetection.video_id) \
+        .order_by(func.count(CarDetection.id).desc()) \
+        .all()
+    results = [
+        {"camera_id": vid_id, "detection_count": count}
+        for vid_id, count in camera_counts
+    ]
+    
+    return results
+
+# Distribution par classe de véhicule
+def get_vehicle_class_distribution(db: Session, period: str = "today") -> List[Dict[str, Any]]:
+    query = db.query(
+        CarDetection.car_class, 
+        func.count(CarDetection.id).label("count")
+    ).filter(CarDetection.car_class.isnot(None))
+    
+    if period == "today":
+        today = date.today()
+        query = query.filter(
+            extract('year', CarDetection.timestamp) == today.year,
+            extract('month', CarDetection.timestamp) == today.month,
+            extract('day', CarDetection.timestamp) == today.day
+        )
+    
+    elif period == "week":
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        query = query.filter(CarDetection.timestamp >= seven_days_ago)
+        
+    elif period == "month":
+        first_day_of_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        query = query.filter(CarDetection.timestamp >= first_day_of_month)
+        
+    
+    class_counts = query \
+        .group_by(CarDetection.car_class) \
+        .order_by(func.count(CarDetection.id).desc()) \
+        .all()
+
+    total_detections = sum(item.count for item in class_counts)
+    
+    if total_detections == 0:
+        return []
+        
+    results = []
+    for class_name, count in class_counts:
+        results.append({
+            "vehicle_class": class_name if class_name else "Inconnu",
+            "count": count,
+            "percentage": round((count / total_detections) * 100, 2)
+        })
+        
+    results.sort(key=lambda x: x['count'], reverse=True)
+    
+    return results
+
+from enum import Enum
+class Period(str, Enum):
+    TODAY = "today"
+    WEEK = "week"
+    MONTH = "month"
+
+def apply_time_filter(query, period: Period):
+    now = datetime.now()
+    if period == Period.TODAY:
+        query = query.filter(
+            extract('year', CarDetection.timestamp) == now.year,
+            extract('month', CarDetection.timestamp) == now.month,
+            extract('day', CarDetection.timestamp) == now.day
+        )
+    
+    elif period == Period.WEEK:
+        seven_days_ago = now - timedelta(days=7)
+        query = query.filter(CarDetection.timestamp >= seven_days_ago)
+        
+    elif period == Period.MONTH:
+        first_day_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        query = query.filter(CarDetection.timestamp >= first_day_of_month)
+        
+    return query
+
+def get_count_stats(db: Session, period: Period) -> Dict[str, Any]:
+    
+    base_query = db.query(CarDetection)
+    filtered_query = apply_time_filter(base_query, period)
+    total_detections = filtered_query.count()
+    active_cameras = filtered_query.with_entities(CarDetection.video_id).distinct().count()
+    vehicles_reported = filtered_query.filter(CarDetection.offense == 1).count()
 
     return {
-        "total_unique_vehicles": total_unique,
-        "details_by_class": [
-            {"car_class": car_class, "unique_vehicle_count": count}
-            for car_class, count in results
-        ]
+        "total_detections": total_detections,
+        "active_cameras": active_cameras,
+        "vehicles_reported": vehicles_reported
     }
+
+# Calcule le nombre de détections par jour pour la période spécifiée
+def get_daily_detection_volume(db: Session, period: Period) -> List[Dict[str, Any]]:
+    now = datetime.now()
+    if period == Period.TODAY:
+        start_date = now - timedelta(days=1) 
+    elif period == Period.WEEK:
+        start_date = now - timedelta(days=7) 
+    elif period == Period.MONTH:
+        start_date = now.replace(day=1) 
+
+    results = db.query(
+        func.date(CarDetection.timestamp).label("detection_day"), 
+        func.count(CarDetection.id).label("detection_count")
+    ).filter(
+        CarDetection.timestamp >= start_date,
+        CarDetection.timestamp < now
+    ).group_by(
+        func.date(CarDetection.timestamp)
+    ).order_by(
+        "detection_day"
+    ).all()
+    formatted_results = []
+    for day_str, count in results:
+        try:
+            day_obj = datetime.strptime(str(day_str), '%Y-%m-%d')
+            day_label = day_obj.strftime('%m/%d/%Y')
+        except ValueError:
+            day_label = str(day_str)
+            
+        formatted_results.append({
+            "day_label": day_label,
+            "count": count
+        })
+        
+    return formatted_results
+
+
+# Recuperer un vehicule par identification
+def get_vehicle_by_id(db: Session, id: int)-> CarDetection | None:
+    return db.query(CarDetection).filter(CarDetection.id == id).first()
+

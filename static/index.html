@@ -2,109 +2,200 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Détection véhicules en temps réel</title>
+    <title>Détection véhicules multi-flux en temps réel</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            display: flex;
-            gap: 20px;
             margin: 20px;
+            /* Layout principal en colonnes: vidéos à gauche, table et notifs à droite */
+            display: grid;
+            grid-template-columns: 2fr 1fr; /* 2/3 pour les vidéos, 1/3 pour la table */
+            gap: 20px;
         }
-        #video-container {
-            flex: 1;
+        #video-streams-container {
+            display: flex;
+            flex-wrap: wrap; /* Permet aux vidéos de s'aligner côte à côte */
+            gap: 20px;
+        }
+        .video-card {
+            border: 1px solid #ddd;
+            padding: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            min-width: 330px; /* Taille minimale pour une vidéo */
+        }
+        .video-card img {
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #000;
+        }
+        .video-stats {
+            margin-top: 5px;
+            font-size: 0.9em;
+        }
+
+        /* Conteneur de la table et des notifications */
+        #aside-container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
         }
         #detections-table {
-            flex: 1;
-            max-width: 400px;
             border-collapse: collapse;
+            width: 100%;
         }
         #detections-table th, #detections-table td {
             border: 1px solid #ccc;
-            padding: 8px;
+            padding: 5px;
+            font-size: 0.85em;
         }
         #detections-table th {
             background-color: #f0f0f0;
         }
-        img {
-            max-width: 640px;
-            height: auto;
-            border: 2px solid #000;
-        }
         #notif-container {
             margin-top: 20px;
+            border-top: 1px solid #eee;
+            padding-top: 10px;
         }
         #notif-list p {
             margin: 0;
             padding: 2px 0;
+            font-size: 0.9em;
         }
     </style>
 </head>
 <body>
-    <div id="video-container">
-        <h2>🚗 Flux vidéo</h2>
-        <img id="video-frame" src="">
-        <div id="fps"></div>
-        <div id="vehicle-count">Véhicules détectés: 0</div>
-        <div id="log"></div>
+    
+    <div id="video-streams-container">
+        <h2>🎥 Flux vidéo en direct</h2>
+        </div>
 
-        <!-- Section notifications -->
+    <div id="aside-container">
+        <h2>📋 Résultats de détection (Tous flux combinés)</h2>
+        <div id="vehicle-count">Véhicules uniques détectés (session): 0</div>
+        <table id="detections-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Cam.</th>
+                    <th>Classe</th>
+                    <th>Plaque</th>
+                    <th>Vitesse (km/h)</th>
+                </tr>
+            </thead>
+            <tbody id="table-body">
+            </tbody>
+        </table>
+
         <div id="notif-container">
             <h3>🔔 Notifications infractions</h3>
             <div id="notif-list"></div>
         </div>
     </div>
 
-    <div id="table-container">
-        <h2>📋 Résultats de détection</h2>
-        <table id="detections-table">
-            <thead>
-                <tr>
-                    <th>Car ID</th>
-                    <th>Car Score</th>
-                    <th>Plaque</th>
-                    <th>Plaque Score</th>
-                </tr>
-            </thead>
-            <tbody id="table-body">
-            </tbody>
-        </table>
-    </div>
 
     <script>
-    // --- WebSocket pour flux vidéo et détection ---
-    const ws = new WebSocket("ws://localhost:8000/ws");
-    const videoFrame = document.getElementById("video-frame");
-    const fpsDisplay = document.getElementById("fps");
-    const tableBody = document.getElementById("table-body");
+    const VIDEO_STREAMS = {
+        "cam_001": "Caméra 1", 
+        "cam_002": "Caméra 2"
+    };
 
-    ws.onopen = () => console.log("Connecté au serveur WebSocket (vidéo)");
+    const ws = new WebSocket("ws://localhost:8000/ws");
+    const videoStreamsContainer = document.getElementById("video-streams-container");
+    const tableBody = document.getElementById("table-body");
+    const uniqueDetectedCars = new Map(); 
+
+    // --- 1. Préparer le DOM pour chaque flux ---
+    function setupVideoContainers() {
+        // Supprimer le titre par défaut pour le remplacer par les cards
+        videoStreamsContainer.innerHTML = ''; 
+
+        for (const [id, title] of Object.entries(VIDEO_STREAMS)) {
+            const card = document.createElement("div");
+            card.className = "video-card";
+            card.innerHTML = `
+                <h3>${title}</h3>
+                <img id="video-frame-${id}" src="placeholder.jpg" alt="Flux vidéo ${id}">
+                <div class="video-stats">
+                    <span id="fps-${id}">FPS: 0.00 | </span>
+                    <span id="frame-nmr-${id}">Frame: 0</span>
+                </div>
+            `;
+            videoStreamsContainer.appendChild(card);
+        }
+    }
+    setupVideoContainers();
+
+
+    // --- 2. Gérer la réception des données multi-flux ---
+    ws.onopen = () => console.log("Connecté au serveur WebSocket (multi-vidéo)");
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        document.getElementById("vehicle-count").textContent = `Véhicules détectés: ${data.vehicle_count}`;
+        const videoId = data.video_id;
+
+        if (!videoId || !VIDEO_STREAMS[videoId]) {
+            console.warn("Données reçues pour un ID vidéo inconnu:", videoId);
+            return;
+        }
+
+        // A. Mettre à jour le flux vidéo et les statistiques
+        const videoFrame = document.getElementById(`video-frame-${videoId}`);
+        const fpsDisplay = document.getElementById(`fps-${videoId}`);
+        const frameNmrDisplay = document.getElementById(`frame-nmr-${videoId}`);
         
-        if (data.video) {
+        if (data.video && videoFrame) {
             videoFrame.src = "data:image/jpeg;base64," + data.video;
         }
 
-        fpsDisplay.innerText = `FPS: ${data.fps.toFixed(2)} | Frame: ${data.frame_nmr}`;
+        if (fpsDisplay && frameNmrDisplay) {
+            fpsDisplay.innerText = `FPS: ${data.fps.toFixed(2)} |`;
+            frameNmrDisplay.innerText = `Frame: ${data.frame_nmr}`;
+        }
 
+
+        // B. Mettre à jour le tableau des détections (combiné)
+        if (data.detections && data.detections.length > 0) {
+            data.detections.forEach(det => {
+                // Utiliser une clé unique (car_id est unique par vidéo dans votre implémentation actuelle)
+                // Pour plus de robustesse, on utiliserait une clé `video_id-car_id`.
+                const mapKey = `${videoId}-${det.car_id}`;
+                
+                // Mettre à jour ou ajouter la détection dans la Map
+                uniqueDetectedCars.set(mapKey, {
+                    ...det,
+                    video_id: videoId
+                });
+            });
+            updateDetectionsTable();
+        }
+    };
+
+    function updateDetectionsTable() {
         tableBody.innerHTML = "";
-        data.detections.forEach(det => {
+        document.getElementById("vehicle-count").textContent = `Véhicules uniques détectés (session): ${uniqueDetectedCars.size}`;
+
+        // Convertir la Map en tableau et trier par ID ou par heure de détection (à améliorer si l'heure est ajoutée)
+        const sortedDetections = Array.from(uniqueDetectedCars.values()).sort((a, b) => b.car_id - a.car_id);
+        
+        sortedDetections.forEach(det => {
             const row = document.createElement("tr");
+            const speed = det.speed_kmh ? `${det.speed_kmh.toFixed(1)} km/h` : "N/A";
+
             row.innerHTML = `
                 <td>${det.car_id}</td>
-                <td>${det.car_detection_score}</td>
+                <td>${det.video_id.replace("cam_", "C")}</td>
+                <td>${det.vehicle_class || "Inconnu"}</td>
                 <td>${det.license_number || "N/A"}</td>
-                <td>${det.license_number_score || 0}</td>
+                <td>${speed}</td>
             `;
             tableBody.appendChild(row);
         });
-    };
+    }
+
     ws.onerror = (error) => console.error("WebSocket error:", error);
     ws.onclose = () => console.log("Déconnecté du serveur WebSocket (vidéo)");
 
 
-    // --- WebSocket pour notifications d'infractions ---
+    // --- 3. WebSocket pour notifications d'infractions (inchangé) ---
     const wsNotif = new WebSocket("ws://localhost:8000/ws/notifications");
     const notifList = document.getElementById("notif-list");
 
@@ -112,8 +203,9 @@
     wsNotif.onmessage = (event) => {
         const data = JSON.parse(event.data);
         const p = document.createElement("p");
-        p.textContent = `🚨 Véhicule ${data.car_id} - ${data.title} à ${data.created_at}`;
-        notifList.prepend(p); // Ajouter en haut pour voir les plus récentes
+        // NOTE: Si le backend ajoute le video_id dans la notif, on peut l'afficher ici
+        p.textContent = `🚨 ${data.title} - Plaque: ${data.license_plate} à ${data.created_at}`;
+        notifList.prepend(p); 
     };
     wsNotif.onerror = (error) => console.error("WebSocket notifications error:", error);
     wsNotif.onclose = () => console.log("Déconnecté du serveur WebSocket (notifications)");

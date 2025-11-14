@@ -1,9 +1,13 @@
 import asyncio
-from fastapi import FastAPI, Request, WebSocket, Depends
+import json
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, Depends, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from io import BytesIO
 import numpy as np
+from sqlalchemy import desc, literal_column, and_
 from ultralytics import YOLO
+from typing import Set
 import cv2
 import time
 from datetime import datetime
@@ -16,12 +20,6 @@ from database import SessionLocal, engine   # Assurez-vous du bon chemin d'impor
 from model import Base
 from detection import *
 from concurrent.futures import ThreadPoolExecutor
-
-# Mémoire globale
-detected_cars = {}
-vehicle_positions = {}
-vehicle_speeds = {}
-captured_car_ids = set()
 
 video_clients: list[WebSocket] = []
 notif_clients: list[WebSocket] = []
@@ -49,17 +47,42 @@ def get_db():
     finally:
         db.close()
 
-# Traitement d'une frame
-def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_tracker,
-                  previous_detections=None, vehicle_count=0):
-    global detected_cars, vehicle_positions, vehicle_speeds, captured_car_ids
+# Stockage chaque vidéo
+video_streams_state = {} 
 
-    if previous_detections is None:
-        previous_detections = set()
+def get_video_state(video_id):
+    """Récupère ou initialise l'état pour une vidéo donnée."""
+    if video_id not in video_streams_state:
+        video_streams_state[video_id] = {
+            "mot_tracker": Sort(),
+            "detected_cars": {},
+            "vehicle_positions": {},
+            "vehicle_speeds": {},
+            "captured_car_ids": set(),
+        }
+    return video_streams_state[video_id]
+
+
+# Traitement d'une frame
+def process_frame(frame, 
+                  coco_model, 
+                  license_plate_detector, 
+                  vehicles,
+                  video_id,
+                  speed_limit):
+    
+    video_state = get_video_state(video_id)
+    detected_cars = video_state["detected_cars"]
+    vehicle_positions = video_state["vehicle_positions"]
+    vehicle_speeds = video_state["vehicle_speeds"]
+    captured_car_ids = video_state["captured_car_ids"]
+    mot_tracker = video_state['mot_tracker']
 
     results = []
-    detections = coco_model(frame)[0]
-    current_detections = set()
+    
+    # 1. Détection des véhicules
+    detections_yolo = coco_model(frame, conf=0.3, classes=vehicles)[0]
+    detections_yolo = detections_yolo.cpu()
 
     height, width, _ = frame.shape
     line_position = int(height * 0.6)
@@ -67,137 +90,159 @@ def process_frame(frame, coco_model, license_plate_detector, vehicles, mot_track
 
     COCO_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
     sort_input = []
+    bbox_to_class_id_map = {}
 
-    for detection in detections.boxes.data.tolist():
+    for detection in detections_yolo.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = detection
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         y_center = int((y1 + y2) / 2)
-        x_center = int((x1 + x2) / 2)
 
+        # Filtrer par classe et position
         if int(class_id) in vehicles and y_center > line_position:
-            current_detections.add(f"{x1}_{y1}_{x2}_{y2}")
-
-            if f"{x1}_{y1}_{x2}_{y2}" not in previous_detections:
-                vehicle_count += 1
+            sort_input.append([x1, y1, x2, y2, score])
+            bbox_key=f"{x1}_{y1}_{x2}_{y2}"
+            bbox_to_class_id_map[bbox_key] = (int(class_id), score)
             draw_border(frame, (x1, y1), (x2, y2), (0, 255, 0), 25, 200, 200)
 
-            sort_input.append([x1, y1, x2, y2, score])
-
-    # Tracker avec SORT
+    # 2. Tracker avec SORT
     track_ids = mot_tracker.update(np.asarray(sort_input))
 
-    # Vitesse et affichage
+    # 3. Traitement par véhicule
     for i, track in enumerate(track_ids):
-        x1, y1, x2, y2, track_id = [int(v) for v in track[:5]]
-        x_center = (x1 + x2) // 2
-        y_center = (y1 + y2) // 2
-
+        xcar1, ycar1, xcar2, ycar2, track_id = [int(v) for v in track[:5]]
+        x_center = (xcar1 + xcar2) // 2
+        y_center = (ycar1 + ycar2) // 2
+        
         # Calcul vitesse
-        speed_px = 0.0
+        speed_kmh = 0.0
         if track_id in vehicle_positions:
             prev_x, prev_y, prev_time = vehicle_positions[track_id]
             dt = time.time() - prev_time
-            dx = x_center - prev_x
-            dy = y_center - prev_y
-            speed_px_new = ((dx**2 + dy**2)**0.5) / dt if dt > 0 else 0
-            prev_speed = vehicle_speeds.get(track_id, 0.0)
-            speed_px = 0.7 * prev_speed + 0.3 * speed_px_new
-        vehicle_speeds[track_id] = speed_px
+            if dt > 0:
+                dx = x_center - prev_x
+                dy = y_center - prev_y
+                speed_px_new = ((dx**2 + dy**2)**0.5) / dt
+                prev_speed = vehicle_speeds.get(track_id, 0.0)
+                speed_px = 0.7 * prev_speed + 0.3 * speed_px_new
+                vehicle_speeds[track_id] = speed_px
+                
+                pixel_to_meter = 0.01
+                speed_kmh = speed_px * pixel_to_meter * 3.6
+        
         vehicle_positions[track_id] = (x_center, y_center, time.time())
+        
 
-        pixel_to_meter = 0.01
-        speed_kmh = speed_px * pixel_to_meter * 3.6
+        # Vérifier si on a déjà toutes les infos pour ce 'track_id'
+        existing_data = detected_cars.get(track_id, {})
+        vehicle_class_name = existing_data.get('vehicle_class')
 
-        class_id = int(detections.boxes.data[i][5])
-        vehicle_class_name = COCO_CLASSES.get(class_id, "unknown")
+        car_detection_score = existing_data.get('car_detection_score', float(track[4]))
 
-    previous_detections.clear()
-    previous_detections.update(current_detections)
+        # Si la classe du véhicule n'est pas encore définie pour ce track_id
+        if vehicle_class_name is None or vehicle_class_name == '' or vehicle_class_name == 'Inconnu':
+            if i < len(sort_input):
+                initial_bbox_data = sort_input[i]
+                x1_init, y1_init, x2_init, y2_init = [int(v) for v in initial_bbox_data[:4]]
+                
+                initial_bbox_key = f"{x1_init}_{y1_init}_{x2_init}_{y2_init}"
+                
+                class_id_from_map = bbox_to_class_id_map.get(initial_bbox_key)
+                
+                if class_id_from_map is not None:
+                    class_id_map, score_map = class_id_from_map
+                    vehicle_class_name = COCO_CLASSES.get(class_id_map, 'Inconnu')
+                    car_detection_score = score_map
 
-    # Détection plaques
-    license_plates = license_plate_detector(frame)[0]
-    for license_plate in license_plates.boxes.data.tolist():
-        x1, y1, x2, y2, score, class_id = license_plate
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        center_y_plate = (y1 + y2) // 2
-        if center_y_plate >= line_position:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            xcar1, ycar1, xcar2, ycar2, car_id = get_car(license_plate, track_ids)
+                    # Mise en cache de la classe
+                    detected_cars.setdefault(track_id, {})['vehicle_class'] = vehicle_class_name
+                    detected_cars.setdefault(track_id,{})['car_detection_score'] = car_detection_score
+                else:
+                    vehicle_class_name = existing_data.get('vehicle_class', 'Inconnu')
+        
+        # 3. Mettre à jour la variable locale
+        if vehicle_class_name not in ["","Inconnu"]:
+            detected_cars.setdefault(track_id, {})['vehicle_class'] = vehicle_class_name
 
-            if car_id != -1:
-                license_plate_crop = frame[y1:y2, x1:x2, :]
-                license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
-                _, license_plate_crop_thresh = cv2.threshold(license_plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
-                license_plate_text, license_plate_text_score = read_license_plate(license_plate_crop_thresh)
-                image_binary_data = None
 
-                vehicle_color_name = "Inconnu" # Initialiser la couleur
-                car_image_crop = None  # Initialiser le crop de la voiture
+        if existing_data.get('license_number') and existing_data.get('vehicle_color') and vehicle_class_name not in ["", "Inconnu"]:
+            existing_data['speed_kmh'] = speed_kmh
+            detected_cars[track_id] = existing_data
+            detected_cars[track_id] = existing_data
+            results.append(existing_data.copy())
+            continue 
 
-                if license_plate_text is not None:
+        # 4. Exécuter la détection de plaque
+        try:
+            car_crop = frame[ycar1:ycar2, xcar1:xcar2, :]
+            
+            # Exécuter le détecteur de plaque sur le petit crop
+            license_plates = license_plate_detector(car_crop, conf=0.5)[0]
+            
+            if len(license_plates.boxes.data) > 0:
+                plate = license_plates.boxes.data.tolist()[0]
+                xp1, yp1, xp2, yp2, plate_score, _ = plate
+                xp1, yp1, xp2, yp2 = int(xp1), int(yp1), int(xp2), int(yp2)
 
-                    existing_data = detected_cars.get(car_id, {})
+                # 5.Exécuter l'OCR
+                plate_crop = car_crop[yp1:yp2, xp1:xp2, :]
+                plate_crop_gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                _, plate_crop_thresh = cv2.threshold(plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+                
+                license_plate_text, license_plate_text_score = read_license_plate(plate_crop_thresh)
+
+                if license_plate_text:
+                    
+                    # Exécuter la détection de couleur
                     vehicle_color_name = existing_data.get('vehicle_color')
-
-                    # ---BLOC DE DÉTECTION DE COULEUR---
                     if vehicle_color_name is None:
-                        try:
-                            car_image_crop = frame[int(ycar1):int(ycar2), int(xcar1):int(xcar2), :]
-                            vehicle_color_name = get_dominant_color(car_image_crop)
-                            print(f"CarID {car_id}: Couleur détectée = {vehicle_color_name}")
+                        vehicle_color_name = get_dominant_color(car_crop)
+                    
+                    # 6. Sauvegarder l'image
+                    image_binary_data = existing_data.get('image_data')
+                    if track_id not in captured_car_ids and image_binary_data is None:
+                        ret, buffer = cv2.imencode('.jpg', car_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        if ret:
+                            image_binary_data = buffer.tobytes()
+                            captured_car_ids.add(track_id)
+                            
+                    # 7. Gerer infraction
+                    offense = False
+                    if speed_kmh > speed_limit:
+                        offense = True
+                        
 
-                        except Exception as e:
-                            print(f"Erreur lors du crop/détection de couleur: {e}")
-                            vehicle_color_name = "Inconnu"
-                        # ---FIN DU BLOC COULEUR---
-                    else:
-                        print(f"CarID {car_id}: Couleur détectée = {vehicle_color_name}")
-
-                    if car_id not in captured_car_ids:
-                        try:
-                            if car_image_crop is None:
-                                car_image_crop = frame[int(ycar1):int(ycar2), int(xcar1):int(xcar2), :]
-
-                            ret, buffer = cv2.imencode('.jpg', car_image_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                            if ret:
-                                image_binary_data = buffer.tobytes()
-                                captured_car_ids.add(car_id)
-                                print(f"Image encodée en mémoire pour car_id {car_id} ({len(image_binary_data)} octets)")
-                            else:
-                                print(f"Échec de l'encodage JPEG pour car_id {car_id}")
-
-                        except Exception as e:
-                            print(f"Erreur d'encodage image : {e}")
-                            image_binary_data = None
-                    else:
-                        image_binary_data = detected_cars.get(car_id, {}).get('image_data')
-
-                    detected_cars[car_id] = {
-                        'car_id': int(car_id),
-                        'car_detection_score': float(score),
-                        'car_bbox': [int(xcar1), int(ycar1), int(xcar2), int(ycar2)],
-                        'license_plate_bbox': [x1, y1, x2, y2],
+                    # 8. Stocker toutes les données
+                    detected_cars[track_id] = {
+                        'car_id': int(track_id),
+                        'car_detection_score': car_detection_score,
+                        'car_bbox': [xcar1, ycar1, xcar2, ycar2],
+                        'license_plate_bbox': [xp1, yp1, xp2, yp2],
                         'license_number': license_plate_text,
                         'license_number_score': float(license_plate_text_score),
                         'speed_kmh': speed_kmh,
                         'vehicle_class': vehicle_class_name,
                         'vehicle_color': vehicle_color_name,
-                        'image_data': image_binary_data
+                        'image_data': image_binary_data,
+                        'video_id': video_id,
+                        'offense': offense
                     }
-                    results.append(detected_cars[car_id])
+                    results.append(detected_cars[track_id])
 
-    return frame, results, vehicle_count
+        except Exception as e:
+            print(f"Erreur de traitement pour track_id {track_id}: {e}")
+            pass
+
+    return frame, results
 
 # Générateur de détections vidéo
-async def generate_detections(video_path="sample.mp4"):
-    mot_tracker = Sort()
+async def generate_detections(video_id:str, video_path="sample.mp4"):
+    video_state = get_video_state(video_id)
+
     vehicles = [2, 3, 5, 7]
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
 
-    vehicle_count = 0
-    previous_detections = set()
     frame_skip = 3
     frame_nmr = 0
     start_time = time.time()
@@ -211,10 +256,12 @@ async def generate_detections(video_path="sample.mp4"):
         frame_nmr += 1
         if frame_nmr % frame_skip != 0:
             continue
-
-        frame, detections, vehicle_count = await asyncio.to_thread(process_frame,
-            frame, coco_model, license_plate_detector, vehicles, mot_tracker,
-            previous_detections, vehicle_count
+        
+        # Initialisation de vitesse max
+        SPEED_LIMIT = 0.4
+        frame, detections = await asyncio.to_thread(process_frame,
+            frame, coco_model, license_plate_detector, vehicles,
+            video_id,SPEED_LIMIT
         )
 
         frame_count += 1
@@ -225,12 +272,12 @@ async def generate_detections(video_path="sample.mp4"):
         frameb64 = base64.b64encode(buffer).decode("utf-8")
 
         yield {
+            "video_id": video_id,
             "frame_nmr": frame_nmr,
             "video": frameb64,
             "fps": fps,
             "detections": detections,
-            "vehicle_count": vehicle_count,
-            "all_detected_cars": list(detected_cars.values())
+            "all_detected_cars": list(video_state['detected_cars'].values())
         }
 
         await asyncio.sleep(0)
@@ -248,29 +295,18 @@ app.add_middleware(
 )
 
 # Fonction Producteur de détections
-# Fonction Producteur de détections
-async def detection_producer(video_path="sample.mp4"):
-    """
-    Génère des détections, sauvegarde les données brutes dans la DB/mémoire,
-    et place une copie sérialisable dans la file d'attente de diffusion.
-    """
+async def detection_producer(video_id: str, video_path="sample.mp4"):
     try:
         # Itérer sur le générateur de détections
-        async for result in generate_detections(video_path):
-            
+        async for result in generate_detections(video_id, video_path):
             db = SessionLocal()
             
             # Préparation des données pour la base de données et la diffusion
             result_to_broadcast = result.copy()
             serializable_detections = []
-            
             try:
-                # Traiter les détections (Sauvegarde et création de la copie à diffuser)
                 for det in result.get("detections", []):
-                    
-                    # --- Sauvegarde DB ---
                     try:
-                        # Assurez-vous que 'save_detection' gère la donnée binaire correctement.
                         await asyncio.to_thread(
                             save_detection,
                             db,
@@ -282,16 +318,38 @@ async def detection_producer(video_path="sample.mp4"):
                             det.get("vehicle_class"),
                             det.get("speed_kmh", 0.0),
                             det.get("vehicle_color", "Inconnu"),
-                            det.get("image_data") # Passe les octets à la DB
+                            det.get("image_data"),
+                            video_id,
+                            det.get('offense', False)
                         )
+                        
                     except Exception as ex:
                         print("Erreur save_detection:", ex)
+                        continue
+
+                    car_det_instance = await asyncio.to_thread(get_car_detection_by_id, db, det["car_id"])
+                    if car_det_instance and car_det_instance.offense:
+                        try:
+                            ws_data = await asyncio.to_thread(
+                                create_offense_notification,
+                                db,
+                                car_det_instance,
+                                car_det_instance.car_class 
+                            )
+
+                            # 3. Diffuser en temps réel la nouvelle notification
+                            if ws_data:
+                                # Encoder en JSON et diffuser
+                                await broadcast_notification(json.dumps(ws_data)) 
                     
-                    # --- Préparation pour la diffusion ---
+                        except Exception as ex:
+                            print("Erreur de broadcast ou création notification:", ex)
+                    
+                    # Préparation pour la diffusion
                     det_copy = det.copy()
                     
                     if 'image_data' in det_copy:
-                        del det_copy['image_data'] # Nettoyage N°1
+                        del det_copy['image_data']
                         
                     serializable_detections.append(det_copy)
 
@@ -326,8 +384,13 @@ async def detection_broadcaster():
             if ws in video_clients:
                 video_clients.remove(ws)
         detection_queue.task_done()
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# --------------- WebSocket endpoint for video -----------------------------
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
-# WebSocket endpoint for video
+# ---------- WebSocket Endpoint pour le flux vidéo-------------------------
 @app.websocket("/ws")
 async def websocket_video(websocket: WebSocket):
     await websocket.accept()
@@ -344,73 +407,427 @@ async def websocket_video(websocket: WebSocket):
         await websocket.close()
         print("Client vidéo déconnecté")
 
-# WebSocket endpoint for notifications
+
+
+notif_clients: Set[WebSocket] = set()
+
+# Fonction pour diffuser un message à tous les clients
+async def broadcast_notification(message: str):
+    send_tasks = []
+    for client in list(notif_clients): 
+        send_tasks.append(client.send_text(message))
+    done, pending = await asyncio.wait(
+        send_tasks,
+        timeout=None,
+        return_when=asyncio.FIRST_EXCEPTION,
+    )
+    for task in done:
+        try:
+            task.result()
+        except WebSocketDisconnect:
+            notif_clients.discard(task._input_w)
+        except Exception as e:
+            print(f"Erreur d'envoi WebSocket: {e}")
+
+
+
+# --------------- WebSocket endpoint pour les notifications ----------------
 @app.websocket("/ws/notifications")
-async def websocket_notifications(websocket: WebSocket):
+async def websocket_notifications_endpoint(websocket: WebSocket):
     await websocket.accept()
-    notif_clients.append(websocket)
-    print("Client notif connecté, total:", len(notif_clients))
+    
+    # Ajouter le client à l'ensemble global
+    notif_clients.add(websocket) 
+    print(f"Nouveau client de notification connecté. Total: {len(notif_clients)}")
+
     try:
         while True:
-            await asyncio.sleep(60)
+            await websocket.receive_text() 
+            
+    except WebSocketDisconnect:
+        notif_clients.discard(websocket)
+        print(f"Client de notification déconnecté. Reste: {len(notif_clients)}")
     except Exception as e:
-        print("websocket_notifications erreur:", e)
-    finally:
-        if websocket in notif_clients:
-            notif_clients.remove(websocket)
-        await websocket.close()
-        print("Client notif déconnecté")
+        print(f"Erreur inattendue sur WS notifications: {e}")
+        notif_clients.discard(websocket)
 
-# Event startup : lancer tasks background
+
+# ----------------- Event startup --------------------
+VIDEO_STREAMS = {
+    "cam_001": "sample.mp4", 
+    "cam_003": "sample.mp4",
+}
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(detection_producer("sample.mp4"))
+    for video_id, video_path in VIDEO_STREAMS.items():
+        asyncio.create_task(detection_producer(video_id, video_path))
+        print(f"Lancement de la détection pour {video_id} ({video_path})")
     asyncio.create_task(detection_broadcaster())
-    # monitor_offenses doit être async et existant (sinon à commenter)
-    # asyncio.create_task(monitor_offenses(notif_clients))
+    #asyncio.create_task(monitor_offenses(notif_clients))
 
-# API endpoints
-@app.get("/save")
-async def save_notif(db: Session = Depends(get_db)):
-    return await save_notification(db)
 
-@app.get("/vehicle")
-def read_vehicle_by_plate(license_plate: str, license_plate_score: float, timestamp: str, db: Session = Depends(get_db)):
-    vehicle = get_vehicle_by_number_plate(db, license_plate, license_plate_score, timestamp)
+
+
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+#---------------------------- API endpoints---------------------------------
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+
+# Recuperation de statistique globales
+@app.get("/dashboard/stats", response_model=Dict[str, Any])
+def read_dashboard_stats(db: Session = Depends(get_db)):
+    try:
+        total_detections = get_total_detections(db)
+        detections_today = get_detections_today(db)
+        active_cameras = get_active_cameras_today(db)
+        total_offenses = get_total_offenses(db)
+        
+        return {
+            "total_detections": total_detections,
+            "detections_today": detections_today,
+            "active_cameras": active_cameras,
+            "vehicles_reported": total_offenses,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des statistiques : {e}")
+
+# Recuperer image
+@app.get("/images/{detection_id}")
+async def serve_car_image(detection_id: int, db: Session = Depends(get_db)):
+    image_data = get_image_data_by_detection_id(db, detection_id)
+
+    if image_data is None:
+        raise HTTPException(status_code=404, detail="Image de détection non trouvée")
+    
+    image_buffer = BytesIO(image_data)
+    
+    return StreamingResponse(image_buffer, media_type="image/jpeg")
+
+
+
+# Recuperer les vehicule recent
+@app.get("/vehicles/recent", response_model=List[Dict[str, Any]])
+def read_recent_detections(limit: int = 10, db: Session = Depends(get_db)):
+    recent_cars = get_recent_detections_best_score(db, limit)
+    results = []
+    for car in recent_cars:
+        timestamp_str = car.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        results.append({
+            "id":car.id,
+            "license_plate": car.license_plate,
+            "license_plate_score": car.license_plate_score,
+            "timestamp": timestamp_str,
+            "video_id": car.video_id,
+            "location": car.location if car.location else "Lieu inconnu",
+            "image_capture": base64.b64encode(car.image_capture).decode("utf-8") if car.image_capture else None
+        })
+    return results
+
+# Recherche par plaque
+@app.get("/vehicles/search", response_model=List[Dict[str, Any]])
+def search_vehicles(plate_query: str, db: Session = Depends(get_db)):
+    if not plate_query:
+        raise HTTPException(status_code=400, detail="Veuillez fournir un numéro de plaque à rechercher.")
+
+    found_cars = search_license_plate(db, plate_query)
+
+    results = []
+    for car in found_cars:
+        timestamp_str = car.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        results.append({
+            "license_plate": car.license_plate,
+            "detection_score": car.license_plate_score,
+            "timestamp": timestamp_str,
+            "camera_id": car.video_id,
+            "location": car.location if car.location else "Lieu inconnu",
+        })
+    return results
+
+# Recuperer les infraction recent
+@app.get("/vehicles/offenses", response_model=List[Dict[str, Any]])
+def read_recent_offenses(limit: int = 30, db: Session = Depends(get_db)):
+    recent_offenses = get_recent_offenses(db, limit)
+    results = []
+    for offense in recent_offenses:
+        timestamp_str = offense.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        results.append({
+            "license_plate": offense.license_plate,
+            "detection_score": offense.license_plate_score,
+            "timestamp": timestamp_str,
+            "camera_id": offense.video_id,
+            "location": offense.location if offense.location else "Lieu inconnu",
+            "image_capture": base64.b64encode(offense.image_capture).decode("utf-8") if offense.image_capture else None,
+            "offense_type": offense.car_class
+        })
+    return results
+
+# Lire les statistique de notification
+@app.get("/notifications/stats", response_model=Dict[str, int])
+def read_notification_stats(db: Session = Depends(get_db)):
+    
+    total_count = db.query(Notification).count()
+    unread_count = db.query(Notification).filter(Notification.is_read == False).count()
+    
+    return {
+        "total": total_count,
+        "unread": unread_count
+    }
+
+# Lire l'historique des notifications
+@app.get("/notifications/history", response_model=List[Dict[str, Any]])
+def read_notification_history(db: Session = Depends(get_db), limit: int = 10):
+    
+    notifications = db.query(Notification).order_by(Notification.event_time.desc()).limit(limit).all()
+    
+    results = []
+    for notif in notifications:
+        results.append({
+            "id": notif.id,
+            "title": notif.title,
+            "is_read": notif.is_read,
+            "event_time": notif.event_time.isoformat(),
+            "car_id": notif.car_id,
+        })
+    return results
+
+# Marquer notification comme lue
+@app.put("/notifications/mark_read/{notification_id}")
+def mark_notification_as_read(notification_id: int, db: Session = Depends(get_db)): 
+    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    
+    if not notification:
+        raise HTTPException(status_code=404, detail="Notification non trouvée")
+        
+    notification.is_read = True
+    db.commit()
+    return {"message": f"Notification {notification_id} marquée comme lue"}
+
+# Marquer toutes les notifications comme lues
+@app.put("/notifications/mark_all_read")
+def mark_all_notifications_as_read(db: Session = Depends(get_db)):
+    db.query(Notification).filter(Notification.is_read == False).update(
+        {Notification.is_read: True}, synchronize_session="fetch"
+    )
+    db.commit()
+    return {"message": "Toutes les notifications non lues ont été marquées comme lues"}
+
+
+# Distribuer par chaque camera
+@app.get("/stats/distribution/camera", response_model=List[Dict[str, Any]])
+def get_camera_distribution(
+    db: Session = Depends(get_db),
+    period: str = Query(default="today", regex="^(today|week|month)$") 
+):
+    try:
+        camera_data = get_detection_volume_by_camera(db, period=period)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des données : {e}")
+
+    total_all_cameras = sum(item["detection_count"] for item in camera_data)
+    
+    if total_all_cameras == 0:
+        return []
+
+    results_with_percent = []
+    for item in camera_data:
+        percent = round((item["detection_count"] / total_all_cameras) * 100, 2)
+        item["percentage"] = percent
+        results_with_percent.append(item)
+        
+    return results_with_percent
+
+
+@app.get("/stats/distribution/vehicle_class", response_model=List[Dict[str, Any]])
+def get_vehicle_class_distribution_api(
+    db: Session = Depends(get_db),
+    period: str = Query(default="today", regex="^(today|week|month)$") 
+):
+    return get_vehicle_class_distribution(db, period=period)
+
+
+# Lire statistique
+PeriodQuery = Query(
+    Period.TODAY, 
+    description="Période des statistiques. Valeurs: 'today', 'week', 'month'"
+)
+@app.get("/global/stats", response_model=Dict[str, Any])
+async def read_global_stats(
+    period: Period = PeriodQuery,
+    db: Session = Depends(get_db)
+):
+    try:
+        stats = get_count_stats(db, period)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur serveur : {e}")
+
+# Volume de Détection Quotidien
+@app.get("/stats/volume/daily", response_model=List[Dict[str, Any]])
+async def get_daily_detection_volume_api(
+    period: Period = PeriodQuery,
+    db: Session = Depends(get_db)
+):
+    try:
+        return get_daily_detection_volume(db, period)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur serveur : {e}")
+
+# Vehicule by id
+@app.get("/vehicle/by/id/{vehicle_id}")
+def read_vehicle_by_id(vehicle_id: int, db: Session = Depends(get_db)):
+    vehicle = get_vehicle_by_id(db, vehicle_id)
     if not vehicle:
-        return {"message": f"Véhicule avec la plaque {license_plate} introuvable"}
-    return vehicle
-
-@app.get("/vehicle/search/detail")
-def read_details_vehicle(license_plate: str, date_start: str, date_end: str, db: Session = Depends(get_db)):
-    details = get_info_vehicle_by_nplate_car_id_datedetection(db, license_plate, date_start, date_end)
-    if not details:
-        return {"message": "Aucun détail trouvé pour ce véhicule."}
-    return details
-
-@app.get("/vehicles")
-def read_all_vehicles(db: Session = Depends(get_db)):
-    vehicles = getAllVehicles(db)
-    return vehicles
-
-@app.get("/vehicles/recent")
-def read_recent_vehicles(limit: int = 5, db: Session = Depends(get_db)):
-    vehicles = getLastVehicles(db, limit)
-    return vehicles
-
-@app.get("/vehicles/best_per_car")
-def read_best_detection_per_car(db: Session = Depends(get_db)):
-    return get_best_detection_per_car(db)
-
-@app.get("/notifications")
-def read_notifications(db: Session = Depends(get_db)):
-    return get_all_notifications(db)
+        raise HTTPException(status_code=404, detail="Véhicule non trouvé")
+    return {
+        "license_plate": vehicle.license_plate,
+        "detection_score": vehicle.license_plate_score,
+        "timestamp": vehicle.timestamp.strftime("%Y-%m-%d %H:%M:%S") if vehicle.timestamp else None,
+        "camera_id": vehicle.video_id,
+        "location": vehicle.location or "Lieu inconnu",
+        "image_capture": base64.b64encode(vehicle.image_capture).decode("utf-8") if vehicle.image_capture else None,
+        "car_class": vehicle.car_class,
+        "vehicle_color": vehicle.vehicle_color,
+        "car_speed": vehicle.car_speed,
+        "car_id": vehicle.car_id
+    }
 
 
-@app.get("/cars/total_unique")
-def read_total_unique_vehicles(db: Session = Depends(get_db)):
-    return get_total_unique_vehicles(db)
+# Recherche de detection par divers critères
+@app.get("/detections/search",
+    summary="Rechercher des détections de véhicules",
+    tags=["Detections"]
+)
+def search_car_detections(
+    db: Session = Depends(get_db),
+    license_plate: Optional[str] = Query(None, description="Plaque d'immatriculation (recherche partielle)."),
+    car_class: Optional[str] = Query(None, description="Type de véhicule (ex: voiture)."),
+    video_id: Optional[str] = Query(None, description="ID de la caméra source (ex: Camera 1)."),
+    start_date: Optional[str] = Query(None, description="Date et heure de début (Format: 31-08-2025 11:23:00)"),
+    end_date: Optional[str] = Query(None, description="Date et heure de fin (Format: 31-08-2025 11:23:00)"),
+):
+    start_dt = None
+    end_dt = None
+    DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
+
+    try:
+        if start_date:
+            start_dt = datetime.strptime(start_date, DATE_FORMAT)
+        if end_date:
+            end_dt = datetime.strptime(end_date, DATE_FORMAT)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format de date/heure invalide. Attendu: {DATE_FORMAT}. Erreur: {e}"
+        )
+
+    query = db.query(CarDetection).distinct(CarDetection.car_id)
+    filters = []
+
+    if license_plate:
+        filters.append(CarDetection.license_plate.ilike(f"%{license_plate}%"))
+
+    if car_class:
+        filters.append(CarDetection.car_class == car_class)
+    if video_id:
+        filters.append(CarDetection.video_id == video_id)
+        
+    if start_dt:
+        filters.append(CarDetection.timestamp >= start_dt)
+
+    if end_dt:
+        filters.append(CarDetection.timestamp <= end_dt)
+
+    if filters:
+        query = query.filter(and_(*filters))
+        
+    window_function = func.row_number().over(
+        partition_by=CarDetection.car_id,
+        order_by=desc(CarDetection.timestamp)
+    ).label("row_number")
+    
+    subquery = db.query(CarDetection, window_function).filter(and_(*filters)).subquery()
+    query = db.query(subquery).filter(literal_column("row_number") == 1)
+        
+    results = query.order_by(desc(subquery.c.timestamp)).limit(10).all()
+    
+    return [
+        {
+            "id": det.id,
+            "license_plate": det.license_plate,
+            "detection_score": det.license_plate_score,
+            "timestamp": det.timestamp.strftime("%Y-%m-%d %H:%M:%S") if det.timestamp else None,
+            "camera_id": det.video_id,
+            "location": det.location or "Lieu inconnu",
+            "car_class": det.car_class,
+            "vehicle_color": det.vehicle_color,
+            "car_speed": det.car_speed,
+            "car_id": det.car_id,
+            "image_capture": base64.b64encode(det.image_capture).decode("utf-8") if det.image_capture else None
+        }
+        for det in results
+    ]
+
+
+# Reserche de detection entre deux date
+@app.get(
+    "/detections/by-date-range",
+    summary="Récupérer toutes les détections entre une date de début et une date de fin",
+    tags=["Detections"]
+)
+def get_detections_by_date_range(
+    db: Session = Depends(get_db),
+    date_start: str = Query(..., description="Date et heure de début (Format: JJ-MM-AAAA HH:MM:SS)"),
+    date_end: str = Query(..., description="Date et heure de fin (Format: JJ-MM-AAAA HH:MM:SS)"),
+):
+    start_dt = None
+    end_dt = None
+    DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
+    try:
+        start_dt = datetime.strptime(date_start, DATE_FORMAT)
+        end_dt = datetime.strptime(date_end, DATE_FORMAT)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format de date/heure invalide. Le format attendu est: {DATE_FORMAT}. Veuillez vérifier les valeurs fournies."
+        )
+
+    query = db.query(CarDetection).filter(
+        and_(
+            CarDetection.timestamp >= start_dt,
+            CarDetection.timestamp <= end_dt
+        )
+    )
+        
+    results = query.order_by(desc(CarDetection.timestamp)).limit(1000).all()
+    
+    return [
+        {
+            "id": det.id,
+            "license_plate": det.license_plate,
+            "detection_score": det.license_plate_score,
+            "timestamp": det.timestamp.strftime("%Y-%m-%d %H:%M:%S") if det.timestamp else None,
+            "camera_id": det.video_id,
+            "location": det.location or "Lieu inconnu",
+            "car_class": det.car_class,
+            "vehicle_color": det.vehicle_color,
+            "car_speed": det.car_speed,
+            "car_id": det.car_id,
+            "image_capture": base64.b64encode(det.image_capture).decode("utf-8") if det.image_capture else None
+        }
+        for det in results
+    ]
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+"""
+@app.get("/detections/search", summary="Rechercher des détections de véhicules avec des dates JJ/MM/AAAA HH:MM:SS", tags=["Detections"] ) def search_car_detections( db: Session = Depends(get_db), license_plate: Optional[str] = Query(None, description="Plaque d'immatriculation (recherche partielle)."), car_class: Optional[str] = Query(None, description="Type de véhicule (ex: voiture)."), video_id: Optional[str] = Query(None, description="ID de la caméra source (ex: Camera 1)."), start_date: Optional[str] = Query(None, description="Date et heure de début (Format: 31-08-2025 11:23:00)"), end_date: Optional[str] = Query(None, description="Date et heure de fin (Format: 31-08-2025 11:23:00)"), ): start_dt = None end_dt = None DATE_FORMAT = "%d-%m-%Y %H:%M:%S" try: if start_date: start_dt = datetime.strptime(start_date, DATE_FORMAT) if end_date: end_dt = datetime.strptime(end_date, DATE_FORMAT) except ValueError as e: raise HTTPException( status_code=400, detail=f"Format de date/heure invalide. Attendu: {DATE_FORMAT}. Erreur: {e}" ) query = db.query(CarDetection).distinct(CarDetection.car_id) filters = [] if license_plate: filters.append(CarDetection.license_plate.ilike(f"%{license_plate}%")) if car_class: filters.append(CarDetection.car_class == car_class) if video_id: filters.append(CarDetection.video_id == video_id) if start_dt: filters.append(CarDetection.timestamp >= start_dt) if end_dt: filters.append(CarDetection.timestamp <= end_dt) if filters: query = query.filter(and_(*filters)) results = query.order_by(CarDetection.timestamp.desc()).limit(10).all() return [ { "id": det.id, "license_plate": det.license_plate, "detection_score": det.license_plate_score, "timestamp": det.timestamp.strftime("%Y-%m-%d %H:%M:%S") if det.timestamp else None, "camera_id": det.video_id, "location": det.location or "Lieu inconnu", "car_class": det.car_class, "vehicle_color": det.vehicle_color, "car_speed": det.car_speed, "car_id": det.car_id, "image_capture": base64.b64encode(det.image_capture).decode("utf-8") if det.image_capture else None, } for det in results ]
+"""

@@ -21,21 +21,25 @@ class CarDetection(Base):
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     image_capture = Column(LargeBinary, nullable=True)
     vehicle_color = Column(String(30), nullable=False)
+    video_id = Column(String(30), nullable=False)
+    location = Column(String(100), nullable=True)
     
     notifications = relationship(
         "Notification",
         back_populates="car_detection",
-        cascade="all, delete",           # suppression en cascade via ORM
-        passive_deletes=True             # utile avec ondelete="CASCADE"
+        cascade="all, delete",
+        passive_deletes=True,
+        # Spécifie quelle colonne de 'Notification' nous lie
+        foreign_keys="Notification.car_id" 
     )
 
     def __repr__(self):
         return f"<CarDetection(id={self.id}, car_id={self.car_id}, license_plate={self.license_plate})>"
     
 class Notification(Base):
-    __tablename__="notification"
+    __tablename__="notifications"
     id = Column(Integer, primary_key=True, index=True)
-    car_id = Column(Integer, ForeignKey("car_detections.car_id", ondelete="CASCADE"), index=True, nullable=False)
+    car_id = Column(Integer, ForeignKey("car_detections.id", ondelete="CASCADE"), index=True, nullable=False)
     title = Column(String(100))
     is_read = Column(Boolean, default=False)
     event_time = Column(DateTime(timezone=True), nullable=False)
