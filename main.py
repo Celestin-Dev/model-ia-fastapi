@@ -6,17 +6,18 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from io import BytesIO
 import numpy as np
 from sqlalchemy import desc, literal_column, and_
+from torch import device
 from ultralytics import YOLO
 from typing import Set
 import cv2
-import time
 from datetime import datetime
 import base64
-
+import time
+from contextlib import asynccontextmanager
 from util import get_car, get_dominant_color, read_license_plate, draw_border
-from sort.sort import Sort  # Assurez-vous du bon chemin d'import
+from sort.sort import Sort
 from sqlalchemy.orm import Session
-from database import SessionLocal, engine   # Assurez-vous du bon chemin d'import
+from database import SessionLocal, engine 
 from model import Base
 from detection import *
 from concurrent.futures import ThreadPoolExecutor
@@ -30,8 +31,8 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 # Initialisation des modèles
 def init_models():
-    coco_model = YOLO('yolov8n_int8_openvino_model')
-    license_plate_detector = YOLO('license_plate_detector_int8_openvino_model')
+    coco_model = YOLO('yolov8n_int8_openvino_model', task="detect")
+    license_plate_detector = YOLO('license_plate_detector_int8_openvino_model', task="detect")
     return coco_model, license_plate_detector
 
 coco_model, license_plate_detector = init_models()
@@ -81,8 +82,9 @@ def process_frame(frame,
     results = []
     
     # 1. Détection des véhicules
-    detections_yolo = coco_model(frame, conf=0.3, classes=vehicles)[0]
-    detections_yolo = detections_yolo.cpu()
+    detections_yolo = coco_model(frame, conf=0.3, classes=vehicles, device='cpu')[0]
+    # detections_yolo = detections_yolo.cuda()
+
 
     height, width, _ = frame.shape
     line_position = int(height * 0.6)
@@ -243,7 +245,7 @@ async def generate_detections(video_id:str, video_path="sample.mp4"):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
 
-    frame_skip = 3
+    frame_skip = 4
     frame_nmr = 0
     start_time = time.time()
     frame_count = 0
@@ -284,15 +286,6 @@ async def generate_detections(video_id:str, video_path="sample.mp4"):
 
     cap.release()
 
-# Application FastAPI
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
-)
 
 # Fonction Producteur de détections
 async def detection_producer(video_id: str, video_path="sample.mp4"):
@@ -384,6 +377,29 @@ async def detection_broadcaster():
             if ws in video_clients:
                 video_clients.remove(ws)
         detection_queue.task_done()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Démarrage du système de détection...")
+    for video_id, video_path in VIDEO_STREAMS.items():
+        asyncio.create_task(detection_producer(video_id, video_path))
+        print(f"Lancement de la détection pour {video_id} ({video_path})")
+    
+    asyncio.create_task(detection_broadcaster())
+    
+    yield
+    
+    print("Arrêt du système de détection...")
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 # --------------- WebSocket endpoint for video -----------------------------
@@ -455,18 +471,8 @@ async def websocket_notifications_endpoint(websocket: WebSocket):
 # ----------------- Event startup --------------------
 VIDEO_STREAMS = {
     "cam_001": "sample.mp4", 
-    "cam_003": "sample.mp4",
+    "cam_002": "sample.mp4",
 }
-@app.on_event("startup")
-async def startup_event():
-    for video_id, video_path in VIDEO_STREAMS.items():
-        asyncio.create_task(detection_producer(video_id, video_path))
-        print(f"Lancement de la détection pour {video_id} ({video_path})")
-    asyncio.create_task(detection_broadcaster())
-    #asyncio.create_task(monitor_offenses(notif_clients))
-
-
-
 
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
@@ -503,8 +509,6 @@ async def serve_car_image(detection_id: int, db: Session = Depends(get_db)):
     image_buffer = BytesIO(image_data)
     
     return StreamingResponse(image_buffer, media_type="image/jpeg")
-
-
 
 # Recuperer les vehicule recent
 @app.get("/vehicles/recent", response_model=List[Dict[str, Any]])
@@ -821,13 +825,61 @@ def get_detections_by_date_range(
         for det in results
     ]
 
+class DateFilter(str, Enum):
+    ALL = "ALL"
+    TODAY = "TODAY"
+    WEEK = "WEEK"
+    MONTH = "MONTH"
+
+class CameraFilter(str, Enum):
+    ALL_CAM = "ALL_CAM"
+    CAM1 = "cam_001"
+    CAM2 = "cam_002"
+
+class TypeFilter(str, Enum):
+    ALL_TYPE = "ALL_TYPE"
+    CAR = "car"
+    MOTO = "motorcycle"
+    BUS = "bus"
+    TRUCK = "truck"
+
+
+@app.get("/detections/filter")
+def get_filtered_detections(
+    det_filter: DateFilter = Query(default=DateFilter.ALL),
+    camera_filter: CameraFilter = Query(default=CameraFilter.ALL_CAM),
+    type_filter: TypeFilter = Query(default=TypeFilter.ALL_TYPE),
+    limit: int = Query(default=10, ge=1, le=100),
+    skip: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db)
+):
+    # Appel de la fonction logique
+    results_filter = filter_detections(
+        db=db, 
+        det_filter=det_filter.value, # .value pour récupérer la string de l'Enum
+        camera_filter=camera_filter, 
+        type_filter=type_filter,
+        limite=limit,
+        skip=skip
+    )
+
+    results = []
+
+    for car in results_filter:
+        
+        results.append({
+            "id":car.id,
+            "license_plate": car.license_plate,
+            "license_plate_score": car.license_plate_score,
+            "timestamp": car.timestamp.strftime("%Y-%m-%d %H:%M:%S") if car.timestamp else None,
+            "video_id": car.video_id,
+            "location": car.location if car.location else "Lieu inconnu",
+            "image_capture": base64.b64encode(car.image_capture).decode("utf-8") if car.image_capture else None
+        })
+
+    return results
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-"""
-@app.get("/detections/search", summary="Rechercher des détections de véhicules avec des dates JJ/MM/AAAA HH:MM:SS", tags=["Detections"] ) def search_car_detections( db: Session = Depends(get_db), license_plate: Optional[str] = Query(None, description="Plaque d'immatriculation (recherche partielle)."), car_class: Optional[str] = Query(None, description="Type de véhicule (ex: voiture)."), video_id: Optional[str] = Query(None, description="ID de la caméra source (ex: Camera 1)."), start_date: Optional[str] = Query(None, description="Date et heure de début (Format: 31-08-2025 11:23:00)"), end_date: Optional[str] = Query(None, description="Date et heure de fin (Format: 31-08-2025 11:23:00)"), ): start_dt = None end_dt = None DATE_FORMAT = "%d-%m-%Y %H:%M:%S" try: if start_date: start_dt = datetime.strptime(start_date, DATE_FORMAT) if end_date: end_dt = datetime.strptime(end_date, DATE_FORMAT) except ValueError as e: raise HTTPException( status_code=400, detail=f"Format de date/heure invalide. Attendu: {DATE_FORMAT}. Erreur: {e}" ) query = db.query(CarDetection).distinct(CarDetection.car_id) filters = [] if license_plate: filters.append(CarDetection.license_plate.ilike(f"%{license_plate}%")) if car_class: filters.append(CarDetection.car_class == car_class) if video_id: filters.append(CarDetection.video_id == video_id) if start_dt: filters.append(CarDetection.timestamp >= start_dt) if end_dt: filters.append(CarDetection.timestamp <= end_dt) if filters: query = query.filter(and_(*filters)) results = query.order_by(CarDetection.timestamp.desc()).limit(10).all() return [ { "id": det.id, "license_plate": det.license_plate, "detection_score": det.license_plate_score, "timestamp": det.timestamp.strftime("%Y-%m-%d %H:%M:%S") if det.timestamp else None, "camera_id": det.video_id, "location": det.location or "Lieu inconnu", "car_class": det.car_class, "vehicle_color": det.vehicle_color, "car_speed": det.car_speed, "car_id": det.car_id, "image_capture": base64.b64encode(det.image_capture).decode("utf-8") if det.image_capture else None, } for det in results ]
-"""

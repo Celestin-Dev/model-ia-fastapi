@@ -1,11 +1,12 @@
-import base64
+
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_,extract 
 from typing import Dict, Any, List, Optional
 from model import CarDetection, Notification
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 import asyncio
+from database import SessionLocal
 
 def save_detection(db: Session, car_id: int, 
                    car_detection_score: float, 
@@ -57,7 +58,6 @@ async def save_notification(db: Session):
     return [{"car_id": r.car_id} for r in results]
 
 # Surveille les nouvelles infractions et envoie + enregistre les notifications
-from database import SessionLocal
 async def monitor_offenses(notif_clients: list):
     last_check = datetime.utcnow() - timedelta(seconds=2)
     recent_notifs = {}
@@ -150,7 +150,6 @@ def get_recent_detections_best_score(db: Session, limit: int = 10):
         .order_by(CarDetection.timestamp.desc()) \
         .limit(limit) \
         .all()
-        
     return recent_unique_detections
 
 # Rechercher par plaque d'immatriculation
@@ -407,3 +406,83 @@ def get_daily_detection_volume(db: Session, period: Period) -> List[Dict[str, An
 def get_vehicle_by_id(db: Session, id: int)-> CarDetection | None:
     return db.query(CarDetection).filter(CarDetection.id == id).first()
 
+
+det_filter = ["ALL", "TODAY", "WEEK", "MONTH"]
+camera_filter = ["ALL_CAM", "cam_001", "cam_002"]
+type_filter = ["ALL_TYPE", "car", "motorcycle", "truck", "bus"]
+
+
+# Supposons que CarDetection est votre modèle SQLAlchemy
+def filter_detections(
+    db: Session, 
+    det_filter: str, 
+    camera_filter: Optional[str], 
+    type_filter: Optional[str], 
+    limite: int, 
+    skip: int = 0
+):
+    
+    query = db.query(CarDetection)
+    now = datetime.now()
+    
+    if det_filter == "TODAY":
+        # Minuit ce matin
+        start_date = datetime.combine(now.date(), dt_time.min)
+        query = query.filter(CarDetection.timestamp >= start_date)
+        
+    elif det_filter == "WEEK":
+        # Il y a 7 jours (à partir de minuit ce jour-là)
+        date_7_days_ago = now - timedelta(days=7)
+        start_date = datetime.combine(date_7_days_ago.date(), dt_time.min)
+        query = query.filter(CarDetection.timestamp >= start_date)
+        
+    elif det_filter == "MONTH":
+        # --- CORRECTION MAJEURE ICI ---
+        # On recule de 30 jours au lieu de forcer le jour 30
+        date_30_days_ago = now - timedelta(days=30)
+        # Optionnel : mettre à minuit pour inclure toute la journée du début
+        start_date = datetime.combine(date_30_days_ago.date(), dt_time.min) 
+        query = query.filter(CarDetection.timestamp >= start_date)
+    
+    # Vérification si le filtre existe ET n'est pas la valeur par défaut "toutes caméras"
+    if camera_filter and camera_filter != "ALL_CAM":
+        query = query.filter(CarDetection.video_id == camera_filter)
+
+    if type_filter and type_filter != "ALL_TYPE":
+        query = query.filter(CarDetection.car_class == type_filter)
+
+    # Tri, Pagination et Exécution
+    query = query.order_by(CarDetection.timestamp.desc())
+    query = query.offset(skip).limit(limite)
+    
+    return query.all()
+
+# def filter_detections( db: Session, det_filter: str, camera_filter: str, type_filter: str, limite: int, skip: int = 0 ):
+    
+#     query = db.query(CarDetection)
+
+#     now = datetime.now()
+    
+#     if det_filter == "TODAY":
+#         start_date = datetime.combine(now.date(), dt_time.min)
+#         query = query.filter(CarDetection.timestamp >= start_date)
+        
+#     elif det_filter == "WEEK":
+#         start_date = now - timedelta(days=7)
+#         start_date = datetime.combine(start_date.date(), dt_time.min)
+#         query = query.filter(CarDetection.timestamp >= start_date)
+        
+#     elif det_filter == "MONTH":
+#         start_date = now.replace(day=30, hour=0, minute=0, second=0, microsecond=0)
+#         query = query.filter(CarDetection.timestamp >= start_date)
+    
+#     if camera_filter and camera_filter != "ALL_CAM":
+#         query = query.filter(CarDetection.video_id == camera_filter)
+
+#     if type_filter and type_filter != "ALL_TYPE":
+#         query = query.filter(CarDetection.car_class == type_filter)
+
+#     query = query.order_by(CarDetection.timestamp.desc())
+#     query = query.offset(skip).limit(limite)
+    
+#     return query.all()
